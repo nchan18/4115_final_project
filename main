@@ -1,0 +1,76 @@
+        def __init__(self):
+        ## Initialize Required Variables
+        self.crashed = False
+        self.DetectCrash = 0
+        self.space = pymunk.Space()
+        self.BuildBot(50.01, 450.01, 20)
+        self.walls = []
+        self.WallShapes = []
+        self.WallRects = []
+        ## Add Walls To The Map ###
+        WallBody, WallShape, WallRect = self.BuildWall(200, 50, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(200, 125, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(200, 550, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(200, 450, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(400, 350, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(400, 250, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(500, 250, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(600, 250, 50)
+        self.WallRects.append(WallRect)
+        WallBody, WallShape, WallRect = self.BuildWall(115, 1050, 500)
+        self.WallRects.append(WallRect)
+        self.PreviousAction = 0
+
+    def BuildWall(self, x, y, r):
+        ### Build Wall On The Map ###
+        size = r
+        WallRect = pygame.Rect(x - r, 600 - y - r, 2 * r, 2 * r)
+        return WallRect, WallRect, WallRect
+
+    def BuildBot(self, x, y, r):
+        ### Build The Bot Object ###
+        size = r
+        BoxPoints = list([Vec2d(-size, -size), Vec2d(-size, size), Vec2d(size, size), Vec2d(size, -size)])
+        # BoxPoints = list(map(Vec2d, [(-size, -size), (-size, size), (size,size), (size, -size)]))
+        mass = 0.5
+        moment = pymunk.moment_for_poly(mass, BoxPoints, Vec2d(0, 0))
+        self.Bot = pymunk.Body(mass, moment)
+        self.Bot.position = (x, y)  # Declare Bot Position
+        self.Bot.angle = 1.54  # Set the Bot Angle
+        BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))  # Get The Direction Vector From Angle
+        self.space.add(self.Bot)
+        self.BotRect = pygame.Rect(x - r, 600 - y - r, 2 * r, 2 * r)
+        return self.Bot
+
+    def DrawEverything(self, flag=0):
+        ### Write Everything On The Game Window ###
+        img = pygame.image.load("./assets/intel.jpg")
+        x, y = 580, 550
+        AdjustedImagePosition = (x - 50, y + 50)
+        screen.blit(img, to_pygame(AdjustedImagePosition, screen))
+        if (flag == 0 and self.DetectCrash == 0):
+            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
+            self.CircleRect = pygame.draw.circle(screen, (169, 169, 169), (self.BotRect.x, self.BotRect.y), 20, 0)
+        ## If Collision Detected Draw Green
+        elif (flag == 0 and self.DetectCrash >= 1):
+            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
+            self.CircleRect = pygame.draw.circle(screen, (0, 255, 0), (self.BotRect.x, self.BotRect.y), 20, 0)
+        ## If Collision Happens Draw Red
+        else:
+            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
+            self.CircleRect = pygame.draw.circle(screen, (255, 0, 0), (self.BotRect.x, self.BotRect.y), 20, 0)
+        img = pygame.image.load("./assets/spherelight.png")
+        offset = Vec2d(*img.get_size()) / 2.0
+        x, y = self.Bot.position
+        y = 600.0 - y
+        AdjustedImagePosition = (x, y) - offset
+        screen.blit(img, AdjustedImagePosition)
+        for ob in self.WallRects:
+            pygame.draw.rect(screen, (169, 169, 169), ob)
