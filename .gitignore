@@ -1,0 +1,5 @@
+videos/*
+pictures*/*
+__pycache__/
+*.pyc
+.venv/
