@@ -11,11 +11,11 @@ import torch
 import math
 import numpy as np
 
-width = 1400  # Width Of The Game Window
-height = 600  # Height Of The Game Window
-pygame.init()
-screen = pygame.display.set_mode((width, height))
-clock = pygame.time.Clock()  # Game Clock
+# width = 1400  # Width Of The Game Window
+# height = 600  # Height Of The Game Window
+# pygame.init()
+# screen = pygame.display.set_mode((width, height))
+# clock = pygame.time.Clock()  # Game Clock
 SummarySensorData = []
 StepSizeValue = 1 / 20.0  # Step Size For Simulation
 ClockTickValue = 100  # Clock Tick
@@ -34,54 +34,6 @@ class BotEnv:
         self.DetectCrash = 0
         self.space = pymunk.Space()
         self.BuildBot(50.01, 450.01, 20)
-        self.walls = []
-        self.WallShapes = []
-        self.WallRects = []
-
-        # helper thickness for walls
-        bw = 20  # wall thickness (adjust to make walls thicker/thinner)
-
-        # We'll build the large dark shell (walls) as rectangular blocks
-        # Coordinates here use (x, y, w, h) where (x,y) is bottom-left
-
-        # --- Outer top band (three segments approximating curved top) ---
-        self.addWall(0, 600 - bw - 0, 1400, bw)     # upper hall top wall
-        self.addWall(100, 600 - 200 - 100, 1200, 200)    # upper hall lower wall
-        self.addWall(0, 0, bw, 600)    # left vertical wall
-        self.addWall(1380, 0, bw, 600)    # right vertical wall
-        #self.addWall(30, 230, bw, 320)
-
-        # --- Outer left vertical blocks (top & bottom combined to make shape) ---
-        #self.addWall(30, 230, bw, 320)   # tall left vertical (upper)
-        #self.addWall(30, 20, bw, 200)    # lower left vertical
-
-        # --- Outer right vertical blocks ---
-        #self.addWall(1320, 230, bw, 320)  # tall right vertical (upper)
-        #self.addWall(1320, 20, bw, 200)   # lower right vertical
-
-        # --- Bottom outer bands ---
-        #self.addWall(50, 20, 400, bw)     # bottom left
-        #self.addWall(500, 20, 400, bw)    # bottom center
-        #self.addWall(1020, 20, 360, bw)   # bottom right
-
-        # --- Inner corridor separators (these are walls inside the shell,
-        #     leave open space between them so corridors remain white) ---
-        #self.addWall(150, 320, 1100, bw)   # central long horizontal wall (creates top/bottom corridor boundaries)
-
-        # Left and right interior vertical separators
-        #self.addWall(240, 120, bw, 260)
-        #self.addWall(1120, 120, bw, 260)
-
-        # extra blocks to match bulges on picture
-        # bottom-left bulge
-        #self.addWall(60, 450, 180, bw)
-        # bottom-right bulge
-        #self.addWall(1200, 450, 180, bw)
-        # small interior vertical near left top
-        #self.addWall(200, 360, bw, 140)
-        # small interior vertical near right top
-        #self.addWall(1200, 360, bw, 140)
-
         self.PreviousAction = 0
 
     # helper to add wall by center-left semantics
@@ -94,17 +46,6 @@ class BotEnv:
         self.WallRects.append(rect)
         return rect
 
-    def BuildWall(self, x, y, w, h):
-        """
-        Build a wall rect.
-        x, y : bottom-left coordinate (0,0 is bottom-left of game)
-        w, h : width and height of the rectangle in pixels
-        We return a pygame.Rect in screen coordinates (pygame's y=0 is top).
-        """
-        # convert bottom-left (x,y) to pygame's rect (top-left)
-        top_left_y = height - (y + h)   # because y given is bottom
-        WallRect = pygame.Rect(int(x), int(top_left_y), int(w), int(h))
-        return WallRect
 
     def BuildBot(self, x, y, r):
         ### Build The Bot Object ###
@@ -120,117 +61,83 @@ class BotEnv:
         self.BotRect = pygame.Rect(x - r, 600 - y - r, 2 * r, 2 * r)
         return self.Bot
 
-    def DrawEverything(self, flag=0):
-        ### Write Everything On The Game Window ###
-        # If you want the intel image, keep it; otherwise ignore load errors
-        try:
-            img = pygame.image.load("./assets/intel.jpg")
-            x, y = 580, 550
-            AdjustedImagePosition = (x - 50, y + 50)
-            screen.blit(img, to_pygame(AdjustedImagePosition, screen))
-        except Exception:
-            pass
+    
+    # def PlanAngle(self, A, B):
+    #     ### Find The Angle Between Two Vector ###
+    #     angle = np.arctan2(B[1] - A[1], B[0] - A[0])
+    #     return angle
 
-        if (flag == 0 and self.DetectCrash == 0):
-            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
-            self.CircleRect = pygame.draw.circle(screen, (169, 169, 169), (int(self.BotRect.x), int(self.BotRect.y)), 20, 0)
-        elif (flag == 0 and self.DetectCrash >= 1):
-            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
-            self.CircleRect = pygame.draw.circle(screen, (0, 255, 0), (int(self.BotRect.x), int(self.BotRect.y)), 20, 0)
-        else:
-            (self.BotRect.x, self.BotRect.y) = self.Bot.position[0], 600 - self.Bot.position[1]
-            self.CircleRect = pygame.draw.circle(screen, (255, 0, 0), (int(self.BotRect.x), int(self.BotRect.y)), 20, 0)
+    # def _step(self, action, CrashStep=0):
+    #     ### Take The Simulation One Step Further ###
+    #     self.Bot.angle = self.Bot.angle % 6.2831853072
+    #     ### If Action Is Left
+    #     if action == 3:
+    #         self.Bot.angle -= 0.02
+    #         self.PreviousBodyAngle = self.Bot.angle
+    #         self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
+    #         BotDirection = self.BotDirection
+    #         if (CrashStep > 0):
+    #             self.Bot.velocity = BotSpeed / 3 * BotDirection
+    #         else:
+    #             self.Bot.velocity = BotSpeed * BotDirection
+    #         self.PreviousAction = 3
+    #     ### If Action Is Right
+    #     elif action == 4:
+    #         self.Bot.angle += 0.02
+    #         self.PreviousBodyAngle = self.Bot.angle
+    #         self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
+    #         BotDirection = self.BotDirection
+    #         self.Bot.velocity = BotSpeed * BotDirection
+    #         if (CrashStep == 1):
+    #             self.Bot.velocity = BotSpeed / 3 * BotDirection
+    #         else:
+    #             self.Bot.velocity = BotSpeed * BotDirection
+    #         self.PreviousAction = 4
+    #     ### If Action Is Straight
+    #     elif action == 5:
+    #         self.Bot.angle += 0.
+    #         self.PreviousBodyAngle = self.Bot.angle
+    #         self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
+    #         BotDirection = self.BotDirection
+    #         self.Bot.velocity = BotSpeed * BotDirection
+    #         if (CrashStep == 1):
+    #             self.Bot.velocity = BotSpeed / 3 * BotDirection
+    #         else:
+    #             self.Bot.velocity = BotSpeed * BotDirection
 
-        try:
-            img = pygame.image.load("./assets/spherelight.png")
-            offset = Vec2d(*img.get_size()) / 2.0
-            x, y = self.Bot.position
-            y = 600.0 - y
-            AdjustedImagePosition = (x, y) - offset
-            screen.blit(img, AdjustedImagePosition)
-        except Exception:
-            pass
-
-        # Draw walls (dark gray) -> inverted map: walls are the dark gray blocks
-        for ob in self.WallRects:
-            pygame.draw.rect(screen, (169, 169, 169), ob)
-
-    def PlanAngle(self, A, B):
-        ### Find The Angle Between Two Vector ###
-        angle = np.arctan2(B[1] - A[1], B[0] - A[0])
-        return angle
-
-    def _step(self, action, CrashStep=0):
-        ### Take The Simulation One Step Further ###
-        self.Bot.angle = self.Bot.angle % 6.2831853072
-        ### If Action Is Left
-        if action == 3:
-            self.Bot.angle -= 0.02
-            self.PreviousBodyAngle = self.Bot.angle
-            self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
-            BotDirection = self.BotDirection
-            if (CrashStep > 0):
-                self.Bot.velocity = BotSpeed / 3 * BotDirection
-            else:
-                self.Bot.velocity = BotSpeed * BotDirection
-            self.PreviousAction = 3
-        ### If Action Is Right
-        elif action == 4:
-            self.Bot.angle += 0.02
-            self.PreviousBodyAngle = self.Bot.angle
-            self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
-            BotDirection = self.BotDirection
-            self.Bot.velocity = BotSpeed * BotDirection
-            if (CrashStep == 1):
-                self.Bot.velocity = BotSpeed / 3 * BotDirection
-            else:
-                self.Bot.velocity = BotSpeed * BotDirection
-            self.PreviousAction = 4
-        ### If Action Is Straight
-        elif action == 5:
-            self.Bot.angle += 0.
-            self.PreviousBodyAngle = self.Bot.angle
-            self.BotDirection = Vec2d(*PointsFromAngle(self.Bot.angle))
-            BotDirection = self.BotDirection
-            self.Bot.velocity = BotSpeed * BotDirection
-            if (CrashStep == 1):
-                self.Bot.velocity = BotSpeed / 3 * BotDirection
-            else:
-                self.Bot.velocity = BotSpeed * BotDirection
-
-        screen.fill(THECOLORS["white"])  ## Clear The Screen (white corridors)
-        self.DrawEverything()  ## Write Everything To The Game
-        self.space.step(StepSizeValue)  ## Take One Step In Simulation
-        clock.tick(ClockTickValue)  ## Tick The Clock
-        x, y = self.Bot.position  ## Get The Bot Position
-        SensorsData = self.AllSensorSensorsData(x, y, self.Bot.angle)  ## Get All The Sensor Data
-        NormalizedSensorsData = [(x - 100.0) / 100.0 for x in SensorsData]  ## Normalize The Sensor Values
-        state = np.array([NormalizedSensorsData])
-        SensorsData = np.append(SensorsData, math.degrees(self.Bot.angle))
-        SensorsData = np.append(SensorsData, [0])
-        print(SensorsData[:-2])  ## Print The Sensor Data
-        DataTensor = torch.Tensor(SensorsData[:-1]).view(1, -1)
-        for ob in self.WallRects:
-            if ob.colliderect(self.CircleRect):
-                self.RecoverFromCrash(BotDirection)
-        # keep boundary check reasonable (map max y should be height)
-        if (x >= width - 20 or x <= 20 or y <= 20 or y >= height + 80):
-            # Note: you may want to tune boundary values
-            self.RecoverFromCrash(BotDirection)
-        SignalData = SensorsData[:-2]
-        if 1 in SignalData:
-            if (action == 5):
-                action = self.PreviousAction
-            self.crashed = True
-            SensorsData[-1] = 1
-            SummarySensorData.append(SensorsData)
-            print(SensorsData[:-2])
-            reward = -500
-            self.RecoverFromCrash(BotDirection)
-        else:
-            self.DetectCrash = 0
-            SummarySensorData.append(SensorsData)
-        return
+    #     screen.fill(THECOLORS["white"])  ## Clear The Screen (white corridors)
+    #     self.DrawEverything()  ## Write Everything To The Game
+    #     self.space.step(StepSizeValue)  ## Take One Step In Simulation
+    #     clock.tick(ClockTickValue)  ## Tick The Clock
+    #     x, y = self.Bot.position  ## Get The Bot Position
+    #     SensorsData = self.AllSensorSensorsData(x, y, self.Bot.angle)  ## Get All The Sensor Data
+    #     NormalizedSensorsData = [(x - 100.0) / 100.0 for x in SensorsData]  ## Normalize The Sensor Values
+    #     state = np.array([NormalizedSensorsData])
+    #     SensorsData = np.append(SensorsData, math.degrees(self.Bot.angle))
+    #     SensorsData = np.append(SensorsData, [0])
+    #     print(SensorsData[:-2])  ## Print The Sensor Data
+    #     DataTensor = torch.Tensor(SensorsData[:-1]).view(1, -1)
+    #     for ob in self.WallRects:
+    #         if ob.colliderect(self.CircleRect):
+    #             self.RecoverFromCrash(BotDirection)
+    #     # keep boundary check reasonable (map max y should be height)
+    #     if (x >= width - 20 or x <= 20 or y <= 20 or y >= height + 80):
+    #         # Note: you may want to tune boundary values
+    #         self.RecoverFromCrash(BotDirection)
+    #     SignalData = SensorsData[:-2]
+    #     if 1 in SignalData:
+    #         if (action == 5):
+    #             action = self.PreviousAction
+    #         self.crashed = True
+    #         SensorsData[-1] = 1
+    #         SummarySensorData.append(SensorsData)
+    #         print(SensorsData[:-2])
+    #         reward = -500
+    #         self.RecoverFromCrash(BotDirection)
+    #     else:
+    #         self.DetectCrash = 0
+    #         SummarySensorData.append(SensorsData)
+    #     return
 
     def RecoverFromCrash(self, BotDirection):
         ### Execute Following When Bot Crashes ###
@@ -323,11 +230,11 @@ def GoStraight(env):
 
 if __name__ == "__main__":
     env = BotEnv()
-    random.seed(10)
-    env._step(3)
-    for i in range(200):
-        if (random.random() > 0.5):
-            TakeLeftOrRightTurn(env)
-        else:
-            GoStraight(env)
-        np.savetxt("./SensorData/SensorData.txt", SummarySensorData)
+    # random.seed(10)
+    # env._step(3)
+    # for i in range(200):
+    #     if (random.random() > 0.5):
+    #         TakeLeftOrRightTurn(env)
+    #     else:
+    #         GoStraight(env)
+    #     np.savetxt("./SensorData/SensorData.txt", SummarySensorData)
