@@ -1,3 +1,6 @@
 opencv-python>=4.5.5
-pygame>=2.0.0
-
+numpy~=1.24.4
+pygame~=2.5.1
+pymunk~=6.5.1
+networkx>=3.0
+pulp>=2.7

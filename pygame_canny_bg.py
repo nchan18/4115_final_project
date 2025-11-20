@@ -26,6 +26,18 @@ import sys
 import cv2
 import numpy as np
 import pygame
+import math
+from typing import Dict, List, Tuple
+
+# optional libraries for planning
+try:
+    import networkx as nx
+except Exception:
+    nx = None
+try:
+    import pulp
+except Exception:
+    pulp = None
 
 
 def load_and_prepare_mask(image_path: Path, world_w: int, world_h: int, low: int, high: int):
@@ -62,6 +74,131 @@ def load_and_prepare_mask(image_path: Path, world_w: int, world_h: int, low: int
     return wall_mask, wall_surf, display_surf
 
 
+def build_grid_graph_from_mask(wall_mask: pygame.mask.Mask,
+                               world_w: int, world_h: int,
+                               grid_step: int = 16) -> Tuple[Dict[Tuple[int, int], int], List[Tuple[int, int, float]]]:
+    """
+    Build grid nodes spaced by grid_step. Return mapping coord->id and list of directed edges (u,v,weight).
+    """
+    node_id: Dict[Tuple[int, int], int] = {}
+    id_counter = 0
+    # sample grid positions with offset to avoid edge clipping
+    for y in range(grid_step // 2, world_h, grid_step):
+        for x in range(grid_step // 2, world_w, grid_step):
+            px = min(world_w - 1, x)
+            py = min(world_h - 1, y)
+            if wall_mask.get_at((px, py)) == 0:
+                node_id[(px, py)] = id_counter
+                id_counter += 1
+
+    edges: List[Tuple[int, int, float]] = []
+    offsets = [(grid_step, 0), (0, grid_step), (-grid_step, 0), (0, -grid_step)]
+    for (x, y), uid in list(node_id.items()):
+        for dx, dy in offsets:
+            nx_coord = (x + dx, y + dy)
+            if nx_coord in node_id:
+                vid = node_id[nx_coord]
+                w = math.hypot(dx, dy)
+                edges.append((uid, vid, w))
+    return node_id, edges
+
+
+def find_nearest_node(coord_to_id: Dict[Tuple[int, int], int], point: Tuple[float, float]) -> Tuple[Tuple[int, int], int]:
+    best = None
+    best_id = None
+    best_d = float('inf')
+    px, py = point
+    for (x, y), nid in coord_to_id.items():
+        d = (x - px) ** 2 + (y - py) ** 2
+        if d < best_d:
+            best_d = d
+            best = (x, y)
+            best_id = nid
+    return best, best_id
+
+
+def solve_shortest_path_ilp(coord_to_id: Dict[Tuple[int, int], int],
+                            edges: List[Tuple[int, int, float]],
+                            start_id: int, goal_id: int) -> List[int]:
+    """
+    Solve ILP shortest path: returns list of node ids in path order, or empty list on failure.
+    Uses pulp if available.
+    """
+    if pulp is None:
+        return []
+    prob = pulp.LpProblem('shortest_path', pulp.LpMinimize)
+    # create variable for each edge index
+    x_vars = {}
+    for i, (u, v, w) in enumerate(edges):
+        x_vars[i] = pulp.LpVariable(f'x_{i}', cat='Binary')
+    # objective
+    prob += pulp.lpSum([w * x_vars[i] for i, (_, _, w) in enumerate(edges)])
+
+    # flow conservation constraints
+    # build incoming/outgoing lists
+    node_in = {nid: [] for nid in range(len(coord_to_id))}
+    node_out = {nid: [] for nid in range(len(coord_to_id))}
+    for i, (u, v, w) in enumerate(edges):
+        node_out[u].append(i)
+        node_in[v].append(i)
+
+    for nid in range(len(coord_to_id)):
+        if nid == start_id:
+            prob += pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 1
+        elif nid == goal_id:
+            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) == 1
+        else:
+            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) - pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 0
+
+    # solve
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    res = prob.solve(solver)
+    if res != 1:
+        return []
+
+    selected = [i for i in x_vars if pulp.value(x_vars[i]) >= 0.5]
+    # build adjacency from selected edges
+    adj = {nid: [] for nid in range(len(coord_to_id))}
+    for i in selected:
+        u, v, w = edges[i]
+        adj[u].append(v)
+
+    # walk from start to goal
+    path = [start_id]
+    cur = start_id
+    visited = set([cur])
+    while cur != goal_id:
+        if not adj.get(cur):
+            break
+        nxt = adj[cur][0]
+        if nxt in visited:
+            break
+        path.append(nxt)
+        visited.add(nxt)
+        cur = nxt
+    if cur != goal_id:
+        return []
+    return path
+
+
+def solve_shortest_path_graph(coord_to_id: Dict[Tuple[int, int], int],
+                              edges: List[Tuple[int, int, float]],
+                              start_id: int, goal_id: int) -> List[int]:
+    """
+    Fallback using networkx Dijkstra to produce ordered node id path.
+    """
+    if nx is None:
+        return []
+    G = nx.DiGraph()
+    for u, v, w in edges:
+        G.add_edge(u, v, weight=w)
+    try:
+        node_path = nx.shortest_path(G, source=start_id, target=goal_id, weight='weight')
+        return node_path
+    except Exception:
+        return []
+
+
 def run(image_path: Path,
         world_w: int = 1920, world_h: int = 1080,
         win_w: int = 800, win_h: int = 600,
@@ -79,13 +216,42 @@ def run(image_path: Path,
 
     wall_mask, wall_surf, bg_surf = load_and_prepare_mask(image_path, world_w, world_h, low, high)
 
-    # player in world coordinates
+    # player in world coordinates (keep same logical size as previous red square: 3x3)
     player_w, player_h = 3, 3
-    player_x, player_y = 1371,637
+    player_x, player_y = world_w // 2, world_h // 2
     speed = 3
-    player_surf = pygame.Surface((player_w, player_h), flags=pygame.SRCALPHA)
-    player_surf.fill((200, 50, 50))
+
+    # try to use robot.py visuals if available, otherwise draw a simple greyscale robot
+    try:
+        import robot as robot_module
+        # robot module defines BuildBot with radius; we'll create a simple sprite matching player_w/player_h
+        def make_robot_sprite(w, h):
+            surf = pygame.Surface((w, h), flags=pygame.SRCALPHA)
+            grey = 160
+            surf.fill((grey, grey, grey))
+            # draw a small darker nose
+            if w >= 6 and h >= 6:
+                darker = (100, 100, 100)
+                points = [(w - 1, h // 2), (w // 2, h // 3), (w // 2, 2 * h // 3)]
+                pygame.draw.polygon(surf, darker, points)
+            return surf
+    except Exception:
+        def make_robot_sprite(w, h):
+            surf = pygame.Surface((w, h), flags=pygame.SRCALPHA)
+            grey = 160
+            surf.fill((grey, grey, grey))
+            if w >= 6 and h >= 6:
+                darker = (100, 100, 100)
+                points = [(w - 1, h // 2), (w // 2, h // 3), (w // 2, 2 * h // 3)]
+                pygame.draw.polygon(surf, darker, points)
+            return surf
+
+    player_surf = make_robot_sprite(player_w, player_h)
     player_mask = pygame.mask.from_surface(player_surf)
+
+    # path following state
+    path_waypoints: List[Tuple[int, int]] = []
+    path_index = 0
 
     running = True
     show_walls = True
@@ -96,7 +262,17 @@ def run(image_path: Path,
         pygame.font.init()
         font = pygame.font.SysFont(None, 20)
 
-    # precompute scaled player surface size for rendering (we will scale each frame)
+    # minimap parameters (keep fixed)
+    minimap_w = min(240, win_w // 4)
+    minimap_h = min(160, win_h // 4)
+    minimap_rect = pygame.Rect(win_w - minimap_w - 8, 8, minimap_w, minimap_h)
+    factor_x = minimap_w / world_w
+    factor_y = minimap_h / world_h
+
+    # graph cache for planning
+    graph_cache = None  # tuple (coord_to_id, edges)
+
+    # main loop
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -106,6 +282,36 @@ def run(image_path: Path,
                     running = False
                 elif event.key == pygame.K_SPACE:
                     show_walls = not show_walls
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                if minimap_rect.collidepoint((mx, my)):
+                    # convert minimap pixel to world coords
+                    wx = int((mx - minimap_rect.x) / factor_x)
+                    wy = int((my - minimap_rect.y) / factor_y)
+                    # build graph if needed
+                    if graph_cache is None:
+                        coord_to_id, edges = build_grid_graph_from_mask(wall_mask, world_w, world_h, grid_step=16)
+                        graph_cache = (coord_to_id, edges)
+                    else:
+                        coord_to_id, edges = graph_cache
+
+                    # find nearest nodes for start and goal
+                    start_coord, start_id = find_nearest_node(coord_to_id, (player_x, player_y))
+                    goal_coord, goal_id = find_nearest_node(coord_to_id, (wx, wy))
+                    planned_ids: List[int] = []
+                    # try ILP first
+                    if pulp is not None:
+                        planned_ids = solve_shortest_path_ilp(coord_to_id, edges, start_id, goal_id)
+                    if not planned_ids and nx is not None:
+                        planned_ids = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
+
+                    if planned_ids:
+                        # convert ids back to coords and set waypoints
+                        id_to_coord = {nid: coord for coord, nid in coord_to_id.items()}
+                        waypoints = [id_to_coord[nid] for nid in planned_ids]
+                        path_waypoints.clear()
+                        path_waypoints.extend(waypoints)
+                        path_index = 0
 
         keys = pygame.key.get_pressed()
         dx = 0
@@ -181,10 +387,59 @@ def run(image_path: Path,
         else:
             wall_scaled = None
 
+        # handle minimap click/planning (minimap top-right)
+        # minimap rendering parameters
+        minimap_w = min(240, win_w // 4)
+        minimap_h = min(160, win_h // 4)
+        minimap_surf = pygame.transform.scale(bg_surf, (minimap_w, minimap_h))
+        minimap_rect = pygame.Rect(win_w - minimap_w - 8, 8, minimap_w, minimap_h)
+
         # draw scaled background
         screen.blit(bg_scaled, (0, 0))
         if wall_scaled is not None:
             screen.blit(wall_scaled, (0, 0))
+
+        # draw minimap background and walls (small)
+        screen.blit(minimap_surf, (minimap_rect.x, minimap_rect.y))
+        # draw wall overlay on minimap
+        wall_minimap = pygame.transform.scale(wall_surf, (minimap_w, minimap_h))
+        screen.blit(wall_minimap, (minimap_rect.x, minimap_rect.y))
+
+        # draw planned path on minimap
+        if path_waypoints:
+            # map world coords to minimap coords
+            factor_x = minimap_w / world_w
+            factor_y = minimap_h / world_h
+            mini_points = [(minimap_rect.x + int(x * factor_x), minimap_rect.y + int(y * factor_y)) for (x, y) in path_waypoints]
+            if len(mini_points) >= 2:
+                pygame.draw.lines(screen, (200, 200, 200), False, mini_points, 2)
+
+        # if following path, update movement toward next waypoint
+        if path_waypoints and path_index < len(path_waypoints):
+            target = path_waypoints[path_index]
+            tx, ty = target
+            # simple proportional move toward target
+            vx = tx - player_x
+            vy = ty - player_y
+            dist = math.hypot(vx, vy)
+            if dist < 1.0:
+                path_index += 1
+            else:
+                move_dx = (vx / dist) * speed
+                move_dy = (vy / dist) * speed
+                # attempt move with collision checks
+                tentative_x = player_x + move_dx
+                tentative_y = player_y + move_dy
+                tentative_x = max(0, min(world_w - player_w, tentative_x))
+                tentative_y = max(0, min(world_h - player_h, tentative_y))
+                overlap = wall_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
+                if overlap is None:
+                    player_x = tentative_x
+                    player_y = tentative_y
+                else:
+                    # collision: stop following (could implement local replan)
+                    path_waypoints = []
+                    path_index = 0
 
         # draw player scaled at viewport coordinates
         screen_player_x = int((player_x - cam_x) * zoom)
@@ -196,7 +451,7 @@ def run(image_path: Path,
         screen.blit(player_vis, (screen_player_x, screen_player_y))
 
         # HUD
-        hud = font.render(f'Zoom: {zoom}x  Player: ({player_x},{player_y})', True, (255, 255, 255))
+        hud = font.render(f'Zoom: {zoom}x  Player: ({int(player_x)},{int(player_y)})', True, (255, 255, 255))
         screen.blit(hud, (8, 8))
 
         pygame.display.flip()
