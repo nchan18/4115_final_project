@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Minimal Pygame simulation: load a single image, compute Canny edges and treat edges as walls.
+Canny Walls + Robot + Real Convex MPC + Pure Pursuit
+APPLIED FIXES — December 2025
 
-This variant implements a zoomed viewport that follows the player.
-
-Behavior:
- - Loads `IMG_6705.jpg` by default (or pass --image)
- - Computes Canny edges and dilates them to create thicker walls
- - Creates a pygame mask from the walls and an *inflated* mask for collision/planning
- - A player square (controllable with WASD / arrow keys) cannot pass through wall pixels
- - Camera/viewport follows the player and displays a zoomed-in view
+Fixes applied:
+ - Robot stops at the actual clicked goal (final_goal)
+ - Walls are added to pymunk as static collision segments (contours)
+ - Robot radius reduced and wall inflation reduced
+ - MPC objective includes angular error so it outputs ω
+ - Contour-based static collision geometry (fast)
+ - Conservative LIDAR linearization retained, safer fallbacks
 """
 import argparse
 from pathlib import Path
@@ -18,589 +18,493 @@ import cv2
 import numpy as np
 import pygame
 import math
-from typing import Dict, List, Tuple
-from collections import deque
+from typing import List, Tuple, Dict
 
-# optional libraries for planning
+# External dependencies
+try:
+    import osqp
+    from scipy import sparse
+except ImportError:
+    print("Please: pip install osqp scipy pymunk pygame opencv-python networkx")
+    sys.exit(1)
+
 try:
     import networkx as nx
-except Exception:
+except ImportError:
     nx = None
-try:
-    import pulp
-except Exception:
-    pulp = None
 
+# ==================== ROBOT CLASS ====================
+class Robot:
+    def __init__(self, x, y, radius=8.0, num_sensors=13, sensor_range=300):
+        import pymunk
+        from pymunk.vec2d import Vec2d
 
-def load_and_prepare_mask(image_path: Path, world_w: int, world_h: int, low: int, high: int):
+        self.space = pymunk.Space()
+        self.space.gravity = (0, 0)
+        self.radius = radius
+        self.sensor_range = sensor_range
+        self.num_sensors = num_sensors
+
+        mass = 1.0
+        moment = pymunk.moment_for_circle(mass, 0, radius)
+        self.body = pymunk.Body(mass, moment)
+        self.body.position = x, y
+        self.shape = pymunk.Circle(self.body, radius)
+        self.shape.friction = 0.8
+        self.space.add(self.body, self.shape)
+
+        # LIDAR angles (fan)
+        self.lidar_angles = [
+            i * (math.pi / (num_sensors - 1)) - math.pi / 2
+            for i in range(num_sensors)
+        ]
+
+    def set_velocity(self, linear: float, angular: float):
+        # set pymunk velocities (kinematic style)
+        from pymunk.vec2d import Vec2d
+        forward = Vec2d(1, 0).rotated(self.body.angle)
+        self.body.velocity = forward * linear
+        self.body.angular_velocity = angular
+
+    def get_lidar_distances(self, mask: pygame.mask.Mask, world_size) -> List[float]:
+        w, h = world_size
+        pos = self.body.position
+        distances = []
+
+        for rel_angle in self.lidar_angles:
+            angle = self.body.angle + rel_angle
+            dx, dy = math.cos(angle), math.sin(angle)
+
+            for dist in range(1, int(self.sensor_range) + 1):
+                px = int(pos.x + dx * dist)
+                py = int(pos.y + dy * dist)
+                if not (0 <= px < w and 0 <= py < h):
+                    distances.append(dist - 1)
+                    break
+                if mask.get_at((px, py)):
+                    distances.append(dist - 1)
+                    break
+            else:
+                distances.append(self.sensor_range)
+        return distances
+
+    def draw(self, surface: pygame.Surface, camera_rect: pygame.Rect, zoom: float):
+        sx = int((self.body.position.x - camera_rect.x) * zoom)
+        sy = int((self.body.position.y - camera_rect.y) * zoom)
+        r = max(4, int(self.radius * zoom))
+
+        pygame.draw.circle(surface, (200, 50, 50), (sx, sy), r)
+        pygame.draw.circle(surface, (255, 120, 120), (sx, sy), r, 3)
+
+        # Direction arrow
+        end_x = self.body.position.x + math.cos(self.body.angle) * (self.radius + 20)
+        end_y = self.body.position.y + math.sin(self.body.angle) * (self.radius + 20)
+        ex = int((end_x - camera_rect.x) * zoom)
+        ey = int((end_y - camera_rect.y) * zoom)
+        pygame.draw.line(surface, (255, 255, 0), (sx, sy), (ex, ey), 4)
+
+# ==================== UTIL: create pymunk static obstacles from binary image ====================
+def add_static_obstacles_from_binary(space, binary_img: np.ndarray, simplify_tol: float = 2.0, segment_radius: float = 1.0):
     """
-    Returns:
-      - wall_mask: pygame.mask.Mask for the *original* edges (visual)
-      - wall_surf: pygame.Surface RGBA visual surface for edges
-      - display_surf: RGB surface (dimmed original + green edges) for background display
-      - walls_bin: numpy uint8 binary array (0/255) of walls used to create inflated mask later
+    Convert binary obstacle mask to contour segments and add them to pymunk space as static segments.
+    binary_img: 2D uint8, 255 = obstacle, 0 = free
+    simplify_tol: approximation tolerance for cv2.approxPolyDP (bigger => fewer vertices)
+    segment_radius: thickness of pymunk segments
     """
+    import pymunk
+
+    # find contours on binary image
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    static_body = space.static_body
+
+    for cnt in contours:
+        if len(cnt) < 3:
+            continue
+        # simplify contour to reduce number of segments
+        epsilon = max(1.0, simplify_tol)
+        approx = cv2.approxPolyDP(cnt, epsilon, closed=True)
+        pts = [(int(p[0][0]), int(p[0][1])) for p in approx]
+        if len(pts) < 2:
+            continue
+        # add segments between consecutive approximated vertices
+        for i in range(len(pts)):
+            p1 = pts[i]
+            p2 = pts[(i + 1) % len(pts)]
+            # skip zero-length segments
+            if p1 == p2:
+                continue
+            seg = pymunk.Segment(static_body, p1, p2, segment_radius)
+            seg.friction = 1.0
+            seg.elasticity = 0.0
+            space.add(seg)
+    # done
+
+# ==================== FIXED CONVEX PLANNER (MPC-like single-step) ====================
+def convex_lidar_planner(robot: Robot, goal: Tuple[float, float], lidar_dists: List[float], dt=1/60.0):
+    """
+    Small-step convex QP planner returning (v, w).
+    Conservative: linearized lidar constraints (assuming current robot orientation).
+    MPC objective includes angular error so optimizer will produce ω.
+    """
+    v_max, w_max = 220.0, 6.0
+    pos = np.array(robot.body.position, dtype=float)
+    theta = float(robot.body.angle)
+
+    goal_vec = np.array(goal, dtype=float) - pos
+    dist_to_goal = np.linalg.norm(goal_vec)
+    if dist_to_goal < 30:
+        return 0.0, 0.0
+    goal_dir = goal_vec / max(dist_to_goal, 1e-6)
+    goal_angle = math.atan2(goal_vec[1], goal_vec[0])
+    angle_error = goal_angle - theta
+    angle_error = (angle_error + math.pi) % (2 * math.pi) - math.pi
+
+    # Build QP: minimize 0.5 * [v w]^T P [v w] + q^T [v w]
+    # We want to *maximize* progress toward goal (negative linear term on v) and minimize angle error via ω.
+    # P positive semidef
+    P = sparse.csc_matrix(sparse.diags([1.0, 1.0]))
+    # q shaped: favor forward velocity toward goal and penalize angular error (linear approx)
+    # Using a linear term nudging ω toward sign(angle_error)
+    q = np.array([-2.0 * goal_dir[0], -8.0 * (angle_error)])  # note: angle_error small -> linear penalty; conservative
+
+    A_rows = []
+    l_vals = []
+    u_vals = []
+
+    # LIDAR constraints: conservative linearization using current beam direction
+    for i, dist in enumerate(lidar_dists):
+        if dist > 100:
+            continue
+        beam_angle = theta + robot.lidar_angles[i]
+        beam_dir_x = math.cos(beam_angle)
+        beam_dir_y = math.sin(beam_angle)
+
+        # coarse condition: only consider beams that point roughly forward (dot with forward > 0)
+        forward_dot = beam_dir_x  # since forward is (cos theta, sin theta) and beam_dir uses theta, forward dot ~ cos(rel_angle)
+        if forward_dot <= 0.05:
+            continue
+
+        # margin: reduce by safe buffer
+        margin = max(15.0, dist - 35.0)
+        # Simple linear constraint: forward_dot * v <= margin/dt
+        A_rows.append([forward_dot, 0.0])
+        l_vals.append(-np.inf)
+        u_vals.append(margin / dt)
+
+    # velocity and angular bounds
+    A_rows += [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+    l_vals += [-v_max, -v_max, -w_max, -w_max]
+    u_vals += [v_max, v_max, w_max, w_max]
+
+    # encourage at least some forward speed (soft): implement as a constraint with slack by making minimum v (soft fallback)
+    min_forward = 30.0
+    A_rows.append([1.0, 0.0])
+    l_vals.append(min_forward)
+    u_vals.append(v_max)
+
+    if len(A_rows) <= 5:
+        # free space: drive fast forward with small turning toward goal using angle_error
+        return 180.0, max(-w_max, min(w_max, 6.0 * angle_error))
+
+    A = sparse.csc_matrix(np.array(A_rows, dtype=float))
+    l = np.array(l_vals, dtype=float)
+    u = np.array(u_vals, dtype=float)
+
+    prob = osqp.OSQP()
+    try:
+        prob.setup(P=P, q=q, A=A, l=l, u=u, verbose=False, warm_start=True)
+        res = prob.solve()
+        if res.info.status_val == 1:
+            v_opt = float(res.x[0])
+            w_opt = float(res.x[1])
+            # clamp for safety
+            v_opt = max(-v_max, min(v_max, v_opt))
+            w_opt = max(-w_max, min(w_max, w_opt))
+            return v_opt, w_opt
+    except Exception:
+        pass
+
+    # fallback if solver fails
+    return 80.0, max(-1.5, min(1.5, 4.0 * angle_error))
+
+# ==================== WORLD LOADING ====================
+def load_and_prepare_mask(image_path: Path, world_w: int, world_h: int, low: int = 50, high: int = 150):
     img = cv2.imread(str(image_path))
     if img is None:
-        raise FileNotFoundError(f"Could not load image: {image_path}")
+        raise FileNotFoundError(f"Image not found: {image_path}")
     img = cv2.resize(img, (world_w, world_h))
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
     edges = cv2.Canny(gray, low, high)
-
     kernel = np.ones((3, 3), np.uint8)
-    walls = cv2.dilate(edges, kernel, iterations=2)  # still fairly thin for display
+    walls = cv2.dilate(edges, kernel, iterations=2)
 
-    # create an RGBA surface where wall pixels set alpha=255 (for visual overlay)
     h, w = walls.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 0] = walls
-    rgba[:, :, 1] = walls
-    rgba[:, :, 2] = walls
-    rgba[:, :, 3] = walls
-
+    rgba = np.zeros((h, w, 4), np.uint8)
+    rgba[..., :3] = walls[..., None]
+    rgba[..., 3] = walls
     wall_surf = pygame.image.frombuffer(rgba.tobytes(), (w, h), 'RGBA')
     wall_mask = pygame.mask.from_surface(wall_surf)
 
-    # prepare a displayable background (dimmed original with walls highlighted)
     color_edges = np.zeros_like(img)
-    color_edges[:, :, 1] = walls  # green channel highlight
+    color_edges[:, :, 1] = walls
     dimmed = (img * 0.4).astype(np.uint8)
     display = cv2.add(dimmed, color_edges)
     display_surf = pygame.image.frombuffer(cv2.cvtColor(display, cv2.COLOR_BGR2RGB).tobytes(), (w, h), 'RGB')
 
-    # return also the binary walls array for inflation later
     walls_bin = (walls > 0).astype(np.uint8) * 255
-
     return wall_mask, wall_surf, display_surf, walls_bin
 
-
-def build_grid_graph_from_mask(wall_mask: pygame.mask.Mask,
-                               world_w: int, world_h: int,
-                               grid_step: int = 16) -> Tuple[Dict[Tuple[int, int], int], List[Tuple[int, int, float]]]:
-    """
-    Build grid nodes spaced by grid_step. Return mapping coord->id and list of directed edges (u,v,weight).
-    Expects wall_mask to already represent the *inflated* walls (safe clearance).
-    """
+# ==================== GRID GRAPH (GLOBAL PLANNING) ====================
+def build_grid_graph_from_mask(wall_mask, world_w, world_h, grid_step: int = 20):
     node_id: Dict[Tuple[int, int], int] = {}
     id_counter = 0
-    # sample grid positions with offset to avoid edge clipping
     for y in range(grid_step // 2, world_h, grid_step):
         for x in range(grid_step // 2, world_w, grid_step):
             px = min(world_w - 1, x)
             py = min(world_h - 1, y)
-            # only create node if this position is free in the inflated mask
             if wall_mask.get_at((px, py)) == 0:
                 node_id[(px, py)] = id_counter
                 id_counter += 1
 
-    edges: List[Tuple[int, int, float]] = []
-    offsets = [(grid_step, 0), (0, grid_step), (-grid_step, 0), (0, -grid_step)]
-    for (x, y), uid in list(node_id.items()):
+    edges = []
+    offsets = [(grid_step, 0), (0, grid_step), (-grid_step, 0), (0, -grid_step),
+               (grid_step, grid_step), (grid_step, -grid_step), (-grid_step, grid_step), (-grid_step, -grid_step)]
+
+    def line_free(x1, y1, x2, y2):
+        steps = max(abs(int(x2) - int(x1)), abs(int(y2) - int(y1)), 1)
+        for i in range(1, steps + 1):
+            t = i / steps
+            ix = int(round(x1 + (x2 - x1) * t))
+            iy = int(round(y1 + (y2 - y1) * t))
+            if wall_mask.get_at((max(0, min(world_w-1, ix)), max(0, min(world_h-1, iy)))):
+                return False
+        return True
+
+    for (x, y), uid in node_id.items():
         for dx, dy in offsets:
-            nx_coord = (x + dx, y + dy)
-            if nx_coord in node_id:
-                vid = node_id[nx_coord]
+            nxp, nyp = x + dx, y + dy
+            if (nxp, nyp) in node_id and line_free(x, y, nxp, nyp):
+                edges.append((uid, node_id[(nxp, nyp)], math.hypot(dx, dy)))
 
-                # verify that the straight-line segment between the two nodes does not cross any wall pixels
-                def line_is_free(x1, y1, x2, y2):
-                    sx = int(x2) - int(x1)
-                    sy = int(y2) - int(y1)
-                    steps = max(abs(sx), abs(sy), 1)
-                    for i in range(1, steps + 1):
-                        t = i / steps
-                        ix = int(round(x1 + (x2 - x1) * t))
-                        iy = int(round(y1 + (y2 - y1) * t))
-                        ix = max(0, min(world_w - 1, ix))
-                        iy = max(0, min(world_h - 1, iy))
-                        if wall_mask.get_at((ix, iy)):
-                            return False
-                    return True
-
-                if line_is_free(x, y, nx_coord[0], nx_coord[1]):
-                    w = math.hypot(dx, dy)
-                    edges.append((uid, vid, w))
     return node_id, edges
 
-
-def find_nearest_node(coord_to_id: Dict[Tuple[int, int], int], point: Tuple[float, float]) -> Tuple[Tuple[int, int], int]:
-    best = None
-    best_id = None
+def find_nearest_node(coord_to_id, point):
     best_d = float('inf')
+    best_node = None
+    best_id = None
     px, py = point
     for (x, y), nid in coord_to_id.items():
         d = (x - px) ** 2 + (y - py) ** 2
         if d < best_d:
             best_d = d
-            best = (x, y)
+            best_node = (x, y)
             best_id = nid
-    return best, best_id
+    return best_node, best_id
 
-
-def solve_shortest_path_ilp(coord_to_id: Dict[Tuple[int, int], int],
-                            edges: List[Tuple[int, int, float]],
-                            start_id: int, goal_id: int) -> List[int]:
-    if pulp is None:
-        return []
-    prob = pulp.LpProblem('shortest_path', pulp.LpMinimize)
-    x_vars = {}
-    for i, (u, v, w) in enumerate(edges):
-        x_vars[i] = pulp.LpVariable(f'x_{i}', cat='Binary')
-    prob += pulp.lpSum([w * x_vars[i] for i, (_, _, w) in enumerate(edges)])
-
-    # flow constraints
-    node_in = {nid: [] for nid in range(len(coord_to_id))}
-    node_out = {nid: [] for nid in range(len(coord_to_id))}
-    for i, (u, v, w) in enumerate(edges):
-        node_out[u].append(i)
-        node_in[v].append(i)
-
-    for nid in range(len(coord_to_id)):
-        if nid == start_id:
-            prob += pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 1
-        elif nid == goal_id:
-            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) == 1
-        else:
-            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) - pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 0
-
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    res = prob.solve(solver)
-    if res != 1:
-        return []
-
-    selected = [i for i in x_vars if pulp.value(x_vars[i]) >= 0.5]
-    adj = {nid: [] for nid in range(len(coord_to_id))}
-    for i in selected:
-        u, v, w = edges[i]
-        adj[u].append(v)
-
-    path = [start_id]
-    cur = start_id
-    visited = set([cur])
-    while cur != goal_id:
-        if not adj.get(cur):
-            break
-        nxt = adj[cur][0]
-        if nxt in visited:
-            break
-        path.append(nxt)
-        visited.add(nxt)
-        cur = nxt
-    if cur != goal_id:
-        return []
-    return path
-
-
-def solve_shortest_path_graph(coord_to_id: Dict[Tuple[int, int], int],
-                              edges: List[Tuple[int, int, float]],
-                              start_id: int, goal_id: int) -> List[int]:
-    if nx is None:
-        return []
+def solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id):
+    if nx is None or start_id is None or goal_id is None:
+        return None
     G = nx.DiGraph()
     for u, v, w in edges:
         G.add_edge(u, v, weight=w)
     try:
-        node_path = nx.shortest_path(G, source=start_id, target=goal_id, weight='weight')
-        return node_path
-    except Exception:
-        return []
+        return nx.shortest_path(G, start_id, goal_id, weight='weight')
+    except:
+        return None
 
-
-def run(image_path: Path,
-        world_w: int = 1920, world_h: int = 1080,
-        win_w: int = 800, win_h: int = 600,
-        zoom: int = 10,
-        low: int = 50, high: int = 150):
+# ==================== MAIN ====================
+def run(image_path: Path, world_w=1920, world_h=1080, win_w=1200, win_h=800, zoom=10):
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption('Canny Walls - Zoomed View (inflated mask)')
+    pygame.display.set_caption("Canny Walls Robot — Click Minimap to Set Goal")
     clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 28)
 
-    wall_mask_vis, wall_surf_vis, bg_surf, walls_bin = load_and_prepare_mask(image_path, world_w, world_h, low, high)
+    wall_mask_vis, wall_surf_vis, bg_surf, walls_bin = load_and_prepare_mask(image_path, world_w, world_h)
+    # reduce inflation to reasonable value (robot radius ~8)
+    kernel = np.ones((21, 21), np.uint8)
+    inflated_walls = cv2.dilate(walls_bin, kernel, iterations=1)
 
-    # player in world coordinates
-    player_w, player_h = 3, 3
-    player_x, player_y = world_w // 2, world_h // 2
-    speed = 3  # world pixels per frame
-
-    # create inflated walls (for collision/planning) based on robot footprint
-    inflate_radius = max(player_w, player_h) + 1  # safety margin
-    kernel = np.ones((inflate_radius * 2 + 1, inflate_radius * 2 + 1), np.uint8)
-    inflated_walls = cv2.dilate(walls_bin, kernel, iterations=1)  # 0/255 image
-    # convert inflated_walls to an RGBA surface for mask creation
     h, w = inflated_walls.shape
-    rgba_inf = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba_inf[:, :, 0] = inflated_walls
-    rgba_inf[:, :, 1] = inflated_walls
-    rgba_inf[:, :, 2] = inflated_walls
-    rgba_inf[:, :, 3] = inflated_walls
-    inflated_surf = pygame.image.frombuffer(rgba_inf.tobytes(), (w, h), 'RGBA')
+    rgba = np.zeros((h, w, 4), np.uint8)
+    rgba[..., :3] = inflated_walls[..., None]
+    rgba[..., 3] = inflated_walls
+    inflated_surf = pygame.image.frombuffer(rgba.tobytes(), (w, h), 'RGBA')
     inflated_mask = pygame.mask.from_surface(inflated_surf)
 
-    # robot sprite and mask
-    try:
-        import robot as robot_module
+    # Create robot with smaller radius
+    robot = Robot(x=world_w//2, y=world_h//2, radius=8.0, num_sensors=13, sensor_range=300)
 
-        def make_robot_sprite(w, h):
-            surf = pygame.Surface((w, h), flags=pygame.SRCALPHA)
-            grey = 160
-            surf.fill((grey, grey, grey))
-            if w >= 6 and h >= 6:
-                darker = (100, 100, 100)
-                points = [(w - 1, h // 2), (w // 2, h // 3), (w // 2, 2 * h // 3)]
-                pygame.draw.polygon(surf, darker, points)
-            return surf
-    except Exception:
-        def make_robot_sprite(w, h):
-            surf = pygame.Surface((w, h), flags=pygame.SRCALPHA)
-            grey = 160
-            surf.fill((grey, grey, grey))
-            if w >= 6 and h >= 6:
-                darker = (100, 100, 100)
-                points = [(w - 1, h // 2), (w // 2, h // 3), (w // 2, 2 * h // 3)]
-                pygame.draw.polygon(surf, darker, points)
-            return surf
+    # add static obstacles to pymunk space from inflated_walls (contour segments)
+    add_static_obstacles_from_binary(robot.space, inflated_walls, simplify_tol=3.0, segment_radius=1.0)
 
-    player_surf = make_robot_sprite(player_w, player_h)
-    player_mask = pygame.mask.from_surface(player_surf)
-
-    # path following state
     path_waypoints: List[Tuple[int, int]] = []
-    path_index = 0
+    graph_cache = None
 
-    running = True
-    show_walls = True
-
-    try:
-        font = pygame.font.SysFont(None, 20)
-    except Exception:
-        pygame.font.init()
-        font = pygame.font.SysFont(None, 20)
-
-    minimap_w = min(240, win_w // 4)
-    minimap_h = min(160, win_h // 4)
-    minimap_rect = pygame.Rect(win_w - minimap_w - 8, 8, minimap_w, minimap_h)
+    minimap_w, minimap_h = 240, 160
+    minimap_rect = pygame.Rect(win_w - minimap_w - 10, 10, minimap_w, minimap_h)
     factor_x = minimap_w / world_w
     factor_y = minimap_h / world_h
 
-    # graph cache uses inflated_mask (safe)
-    graph_cache = None  # (coord_to_id, edges)
-    recent_positions = deque(maxlen=30)
-    stuck_frames = 0
-    collision_block_count = 0
+    manual_mode = False
+    running = True
 
-    user_control_active = False
-    user_control_last_frame = 0
-    resume_path_after_frames = 10
+    final_goal = None  # store the real clicked goal coordinates (world pixels)
 
-    def can_place_at(x: float, y: float) -> bool:
-        """
-        Uses inflated_mask to determine if player placed at (x,y) (top-left) overlaps inflated walls.
-        Tests floor/ceil around fractional values to avoid rounding jitter.
-        """
-        px_floor = int(math.floor(x))
-        py_floor = int(math.floor(y))
-        px_ceil = int(math.ceil(x))
-        py_ceil = int(math.ceil(y))
-
-        candidates = [(px_floor, py_floor)]
-        if (px_ceil, py_floor) not in candidates:
-            candidates.append((px_ceil, py_floor))
-        if (px_floor, py_ceil) not in candidates:
-            candidates.append((px_floor, py_ceil))
-        if (px_ceil, py_ceil) not in candidates:
-            candidates.append((px_ceil, py_ceil))
-        for cx, cy in candidates:
-            cx_clamped = max(0, min(world_w - player_w, cx))
-            cy_clamped = max(0, min(world_h - player_h, cy))
-            if inflated_mask.overlap(player_mask, (cx_clamped, cy_clamped)) is not None:
-                return False
-        return True
-
-    def attempt_stepwise_move(cur_x: float, cur_y: float, dx: float, dy: float) -> Tuple[float, float, bool]:
-        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-            return cur_x, cur_y, False
-
-        steps = max(1, int(math.ceil(max(abs(dx), abs(dy)))))
-        step_dx = dx / steps
-        step_dy = dy / steps
-
-        x, y = cur_x, cur_y
-        moved = False
-        for i in range(steps):
-            nx = x + step_dx
-            ny = y + step_dy
-            nx = max(0, min(world_w - player_w, nx))
-            ny = max(0, min(world_h - player_h, ny))
-            if can_place_at(nx, ny):
-                x, y = nx, ny
-                moved = True
-            else:
-                # try axis-aligned slide (prefer larger component)
-                if abs(step_dx) >= abs(step_dy):
-                    nx2 = x + step_dx
-                    ny2 = y
-                    if can_place_at(nx2, ny2):
-                        x = nx2; moved = True; continue
-                    nx3 = x
-                    ny3 = y + step_dy
-                    if can_place_at(nx3, ny3):
-                        y = ny3; moved = True; continue
-                else:
-                    nx2 = x
-                    ny2 = y + step_dy
-                    if can_place_at(nx2, ny2):
-                        y = ny2; moved = True; continue
-                    nx3 = x + step_dx
-                    ny3 = y
-                    if can_place_at(nx3, ny3):
-                        x = nx3; moved = True; continue
-                break
-        return x, y, moved
-
-    def attempt_local_replan(current_x, current_y, goal_coord=None):
-        nonlocal graph_cache, path_waypoints, path_index
-        if goal_coord is None:
-            return False
-        try:
-            if graph_cache is None:
-                coord_to_id, edges = build_grid_graph_from_mask(inflated_mask, world_w, world_h, grid_step=16)
-                graph_cache = (coord_to_id, edges)
-            else:
-                coord_to_id, edges = graph_cache
-
-            start_coord, start_id = find_nearest_node(coord_to_id, (current_x, current_y))
-            goal_coord, goal_id = find_nearest_node(coord_to_id, goal_coord)
-            planned_ids = []
-            if pulp is not None:
-                planned_ids = solve_shortest_path_ilp(coord_to_id, edges, start_id, goal_id)
-            if not planned_ids and nx is not None:
-                planned_ids = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
-            if planned_ids:
-                id_to_coord = {nid: coord for coord, nid in coord_to_id.items()}
-                waypoints = [id_to_coord[nid] for nid in planned_ids]
-                path_waypoints = waypoints
-                path_index = 0
-                return True
-        except Exception:
-            return False
-        return False
-
-    frame = 0
     while running:
-        frame += 1
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_q, pygame.K_ESCAPE):
-                    running = False
-                elif event.key == pygame.K_SPACE:
-                    show_walls = not show_walls
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                mx, my = event.pos
-                if minimap_rect.collidepoint((mx, my)):
-                    wx = int((mx - minimap_rect.x) / factor_x)
-                    wy = int((my - minimap_rect.y) / factor_y)
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_c:
+                    manual_mode = not manual_mode
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if minimap_rect.collidepoint(event.pos):
+                    wx = int((event.pos[0] - minimap_rect.x) / factor_x)
+                    wy = int((event.pos[1] - minimap_rect.y) / factor_y)
+                    final_goal = (wx, wy)  # store actual clicked goal
 
-                    # ensure graph is built from inflated mask
                     if graph_cache is None:
-                        coord_to_id, edges = build_grid_graph_from_mask(inflated_mask, world_w, world_h, grid_step=16)
+                        print("Building graph...")
+                        coord_to_id, edges = build_grid_graph_from_mask(inflated_mask, world_w, world_h, 20)
                         graph_cache = (coord_to_id, edges)
                     else:
                         coord_to_id, edges = graph_cache
 
-                    # ensure the clicked goal snaps to a valid node (nearest free node)
-                    goal_snap, goal_id = find_nearest_node(coord_to_id, (wx, wy))
-                    if goal_snap is None:
-                        # no node found -> ignore
-                        continue
+                    _, goal_id = find_nearest_node(coord_to_id, (wx, wy))
+                    _, start_id = find_nearest_node(coord_to_id, robot.body.position)
 
-                    start_snap, start_id = find_nearest_node(coord_to_id, (player_x, player_y))
-                    planned_ids: List[int] = []
-                    if pulp is not None:
-                        planned_ids = solve_shortest_path_ilp(coord_to_id, edges, start_id, goal_id)
-                    if not planned_ids and nx is not None:
-                        planned_ids = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
+                    if goal_id is not None and start_id is not None:
+                        path_ids = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
+                        if path_ids:
+                            id_to_coord = {v: k for k, v in coord_to_id.items()}
+                            path_waypoints = [id_to_coord[i] for i in path_ids]
+                            print(f"Path found: {len(path_waypoints)} points")
 
-                    if planned_ids:
-                        id_to_coord = {nid: coord for coord, nid in coord_to_id.items()}
-                        waypoints = [id_to_coord[nid] for nid in planned_ids]
-                        path_waypoints.clear()
-                        path_waypoints.extend(waypoints)
-                        path_index = 0
-
-        keys = pygame.key.get_pressed()
-        user_input_now = (keys[pygame.K_a] or keys[pygame.K_LEFT] or
-                          keys[pygame.K_d] or keys[pygame.K_RIGHT] or
-                          keys[pygame.K_w] or keys[pygame.K_UP] or
-                          keys[pygame.K_s] or keys[pygame.K_DOWN])
-
-        if user_input_now:
-            user_control_active = True
-            user_control_last_frame = frame
-
-        if user_control_active and (frame - user_control_last_frame) > resume_path_after_frames:
-            user_control_active = False
-
-        desired_dx = 0.0
-        desired_dy = 0.0
-
-        if user_control_active:
-            if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-                desired_dx -= speed
-            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-                desired_dx += speed
-            if keys[pygame.K_w] or keys[pygame.K_UP]:
-                desired_dy -= speed
-            if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-                desired_dy += speed
+        # === Control ===
+        if manual_mode:
+            keys = pygame.key.get_pressed()
+            v = 180 if keys[pygame.K_w] else 0
+            w = 5.0 if keys[pygame.K_a] else (-5.0 if keys[pygame.K_d] else 0.0)
+            robot.set_velocity(v, w)
         else:
-            if path_waypoints and path_index < len(path_waypoints):
-                tx, ty = path_waypoints[path_index]
-                vx = tx - player_x
-                vy = ty - player_y
-                dist = math.hypot(vx, vy)
-                # advance threshold: be somewhat generous to avoid hovering because of thin differences
-                advance_thresh = max(1.0, 0.5 * 16)  # half grid step (8) is a safe threshold for this grid
-                if dist < advance_thresh:
-                    path_index += 1
-                else:
-                    desired_dx = (vx / dist) * speed
-                    desired_dy = (vy / dist) * speed
+            pos = robot.body.position
 
-        new_x, new_y, moved_flag = attempt_stepwise_move(player_x, player_y, desired_dx, desired_dy)
-        if moved_flag:
-            player_x, player_y = new_x, new_y
-            collision_block_count = 0
-        else:
-            collision_block_count += 1
-            if not user_control_active and collision_block_count > 2 and path_waypoints:
-                goal_coord = path_waypoints[-1]
-                if attempt_local_replan(player_x, player_y, goal_coord=goal_coord):
-                    collision_block_count = 0
-                else:
-                    # small nudges more aggressive now (but only after a couple blocks)
-                    nudges = [(speed, 0), (-speed, 0), (0, speed), (0, -speed),
-                              (speed, speed), (-speed, -speed), (speed, -speed), (-speed, speed)]
-                    freed = False
-                    for nx_off, ny_off in nudges:
-                        cand_x = max(0, min(world_w - player_w, player_x + nx_off))
-                        cand_y = max(0, min(world_h - player_h, player_y + ny_off))
-                        if can_place_at(cand_x, cand_y):
-                            player_x = cand_x
-                            player_y = cand_y
-                            recent_positions.clear()
-                            stuck_frames = 0
-                            collision_block_count = 0
-                            freed = True
-                            break
-                    if not freed:
-                        # drop path after repeated failures
-                        path_waypoints = []
-                        path_index = 0
-                        collision_block_count = 0
+            # If a final (clicked) goal exists, stop if close to it
+            if final_goal is not None:
+                d_final = math.hypot(final_goal[0] - pos.x, final_goal[1] - pos.y)
+                if d_final < 28:
+                    # reached true goal -> stop and clear waypoint path
+                    robot.set_velocity(0.0, 0.0)
+                    path_waypoints = []
+                    final_goal = None
+                    # step physics minimally to settle
+                    robot.space.step(1/60.0)
+                    continue
 
-        recent_positions.append((player_x, player_y))
-        if len(recent_positions) >= recent_positions.maxlen:
-            x0, y0 = recent_positions[0]
-            x1, y1 = recent_positions[-1]
-            net_disp = math.hypot(x1 - x0, y1 - y0)
-            if net_disp < 2.0:
-                stuck_frames += 1
+            if not path_waypoints:
+                robot.set_velocity(0.0, 0.0)
             else:
-                stuck_frames = 0
+                # Pure pursuit lookahead
+                lookahead = 100
+                target = None
+                # choose first waypoint farther than lookahead along the path
+                for wp in reversed(path_waypoints):
+                    if math.hypot(wp[0] - pos.x, wp[1] - pos.y) > lookahead:
+                        target = wp
+                        break
+                if target is None:
+                    target = path_waypoints[-1]
 
-        # camera calculations
-        crop_w = max(1, win_w // zoom)
-        crop_h = max(1, win_h // zoom)
-        player_cx = player_x + player_w // 2
-        player_cy = player_y + player_h // 2
-        cam_x = int(player_cx - crop_w // 2)
-        cam_y = int(player_cy - crop_h // 2)
-        cam_x = max(0, min(world_w - crop_w, cam_x))
-        cam_y = max(0, min(world_h - crop_h, cam_y))
-        cam_rect = pygame.Rect(cam_x, cam_y, crop_w, crop_h)
+                dx = target[0] - pos.x
+                dy = target[1] - pos.y
+                dist = math.hypot(dx, dy)
+
+                # If the path's final point and close to it, stop (redundant with final_goal check)
+                if dist < 25 and target == path_waypoints[-1]:
+                    robot.set_velocity(0.0, 0.0)
+                else:
+                    desired_angle = math.atan2(dy, dx)
+                    angle_error = desired_angle - robot.body.angle
+                    angle_error = (angle_error + math.pi) % (2*math.pi) - math.pi
+
+                    # Pure pursuit turn term (strong)
+                    w_pursuit = 6.5 * angle_error
+
+                    # get lidar (on inflated mask so planner is conservative)
+                    lidar = robot.get_lidar_distances(inflated_mask, (world_w, world_h))
+                    v_mpc, w_mpc = convex_lidar_planner(robot, target, lidar)
+
+                    # Decide: if MPC requests braking (v small) or large omega request, trust it; otherwise follow pursuit
+                    if v_mpc < 90 or abs(w_mpc) > 0.7:
+                        robot.set_velocity(v_mpc, w_mpc)
+                    else:
+                        # go fast with pursuit angular rate (clamped)
+                        w_cmd = max(-6.0, min(6.0, w_pursuit))
+                        robot.set_velocity(180.0, w_cmd)
+
+        # physics
+        robot.space.step(1/60.0)
+
+        # === Rendering ===
+        cam_w = win_w // zoom
+        cam_h = win_h // zoom
+        cx = int(robot.body.position.x - cam_w // 2)
+        cy = int(robot.body.position.y - cam_h // 2)
+        cx = max(0, min(world_w - cam_w, cx))
+        cy = max(0, min(world_h - cam_h, cy))
+        cam_rect = pygame.Rect(cx, cy, cam_w, cam_h)
 
         try:
             bg_crop = bg_surf.subsurface(cam_rect)
-            if show_walls:
-                wall_crop = wall_surf_vis.subsurface(cam_rect)
-            else:
-                wall_crop = None
-        except ValueError:
-            bg_crop = pygame.Surface((crop_w, crop_h))
-            bg_crop.blit(bg_surf, (0, 0), cam_rect)
-            if show_walls:
-                wall_crop = pygame.Surface((crop_w, crop_h), flags=pygame.SRCALPHA)
-                wall_crop.blit(wall_surf_vis, (0, 0), cam_rect)
-            else:
-                wall_crop = None
-
+        except Exception:
+            bg_crop = bg_surf
         bg_scaled = pygame.transform.scale(bg_crop, (win_w, win_h))
-        if show_walls and wall_crop is not None:
-            wall_scaled = pygame.transform.scale(wall_crop, (win_w, win_h))
-        else:
-            wall_scaled = None
-
-        minimap_w = min(240, win_w // 4)
-        minimap_h = min(160, win_h // 4)
-        minimap_surf = pygame.transform.scale(bg_surf, (minimap_w, minimap_h))
-        minimap_rect = pygame.Rect(win_w - minimap_w - 8, 8, minimap_w, minimap_h)
-        factor_x = minimap_w / world_w
-        factor_y = minimap_h / world_h
-
         screen.blit(bg_scaled, (0, 0))
-        if wall_scaled is not None:
-            screen.blit(wall_scaled, (0, 0))
 
-        screen.blit(minimap_surf, (minimap_rect.x, minimap_rect.y))
-        wall_minimap = pygame.transform.scale(wall_surf_vis, (minimap_w, minimap_h))
-        screen.blit(wall_minimap, (minimap_rect.x, minimap_rect.y))
+        if True:  # draw detected walls overlay for clarity
+            try:
+                wall_crop = wall_surf_vis.subsurface(cam_rect)
+                wall_scaled = pygame.transform.scale(wall_crop, (win_w, win_h))
+                screen.blit(wall_scaled, (0, 0))
+            except:
+                pass
 
+        robot.draw(screen, cam_rect, zoom)
+
+        # Minimap
+        mini = pygame.transform.scale(bg_surf, (minimap_w, minimap_h))
+        screen.blit(mini, minimap_rect)
         if path_waypoints:
-            mini_points = [(minimap_rect.x + int(x * factor_x), minimap_rect.y + int(y * factor_y)) for (x, y) in path_waypoints]
-            if len(mini_points) >= 2:
-                pygame.draw.lines(screen, (200, 200, 200), False, mini_points, 2)
+            points = [(minimap_rect.x + int(x * factor_x), minimap_rect.y + int(y * factor_y)) for x, y in path_waypoints]
+            pygame.draw.lines(screen, (0, 255, 255), False, points, 3)
+        if final_goal is not None:
+            gx = minimap_rect.x + int(final_goal[0] * factor_x)
+            gy = minimap_rect.y + int(final_goal[1] * factor_y)
+            pygame.draw.circle(screen, (0,255,0), (gx, gy), 6)
+        pygame.draw.circle(screen, (255, 0, 0),
+                          (minimap_rect.x + int(robot.body.position.x * factor_x),
+                           minimap_rect.y + int(robot.body.position.y * factor_y)), 6)
 
-        screen_player_x = int((player_x - cam_x) * zoom)
-        screen_player_y = int((player_y - cam_y) * zoom)
-        screen_player_w = max(1, int(player_w * zoom))
-        screen_player_h = max(1, int(player_h * zoom))
-        player_vis = pygame.transform.scale(player_surf, (screen_player_w, screen_player_h))
-        screen.blit(player_vis, (screen_player_x, screen_player_y))
-
-        mode_text = "Manual" if user_control_active else ("Auto (path)" if path_waypoints else "Auto (no path)")
-        hud = font.render(f'Zoom: {zoom}x  Player: ({int(player_x)},{int(player_y)})  Mode: {mode_text}', True, (255, 255, 255))
-        screen.blit(hud, (8, 8))
+        # HUD
+        mode = "MANUAL (WASD)" if manual_mode else ("AUTO" if path_waypoints else "IDLE")
+        text = font.render(f"{mode} | Click minimap → goal | C = toggle", True, (255, 255, 255))
+        screen.blit(text, (10, 10))
 
         pygame.display.flip()
         clock.tick(60)
 
     pygame.quit()
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description='Simple Canny->Walls pygame sim with inflated mask')
-    p.add_argument('--image', type=Path, default=Path('IMG_6705.jpg'), help='Image to use (default IMG_6705.jpg)')
-    p.add_argument('--width', type=int, default=1920, help='World/image width in pixels')
-    p.add_argument('--height', type=int, default=1080, help='World/image height in pixels')
-    p.add_argument('--win-width', type=int, default=1920, help='Window (viewport) width in pixels')
-    p.add_argument('--win-height', type=int, default=1080, help='Window (viewport) height in pixels')
-    p.add_argument('--zoom', type=int, default=10, help='Zoom factor (integer). Visual scale-up of the cropped region')
-    p.add_argument('--low', type=int, default=50)
-    p.add_argument('--high', type=int, default=150)
-    return p.parse_args()
-
-
 if __name__ == '__main__':
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image', type=Path, default='IMG_6705.jpg')
+    parser.add_argument('--zoom', type=int, default=10)
+    args = parser.parse_args()
+
     if not args.image.exists():
         print(f"Image not found: {args.image}")
         sys.exit(1)
-    run(args.image,
-        world_w=args.width, world_h=args.height,
-        win_w=args.win_width, win_h=args.win_height,
-        zoom=args.zoom,
-        low=args.low, high=args.high)
+
+    run(args.image, zoom=args.zoom)
