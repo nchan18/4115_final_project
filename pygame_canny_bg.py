@@ -1,397 +1,41 @@
 #!/usr/bin/env python3
 """
 Canny Walls + Simple Robot Sprite + 5-beam LIDAR
-— Full script with wall-safe minimap (max-pool downsample), convexified/simplified
+— FULL script with wall-safe minimap (max-pool downsample), convexified/simplified
   planning, and planning checks against the full-resolution wall mask so plans
   do not pass through walls that vanish under naive downsampling.
 
-Key changes vs prior:
- - minimap walls produced by **max-pooling** (preserves thin walls)
- - minimap click -> world conversion uses minimap size but minimap visuals reflect pooled walls
- - planner builds graph from full-res wall mask and verifies line-of-sight using full-res mask
- - path simplification (shortcutting) uses full-res LOS checks
- - LIDAR beams shorter and thinner
+Patches applied (selected):
+ - (2) Hard stop / slow when LIDAR sees object (pre-collision behavior)
+ - (3) Stronger wall collision checks (center + perimeter sampling + swept check)
+ - (4) Automatic replanning when LIDAR detects unknown static objects or collision predicted
+ - (6) Random static objects added to the world (unknown to planner)
+ - (7) combined_mask = walls + static objects; used for LIDAR + movement checks
+ - (8) Swept collision checks to avoid slipping through corners (interpolated samples)
 """
 import argparse
 from pathlib import Path
 import sys
 import math
-from typing import Dict, List, Tuple
-import pymunk
+from typing import List, Tuple
+import random
 
 import cv2
 import numpy as np
 import pygame
 
-# optional planning libs
-try:
-    import networkx as nx
-except Exception:
-    nx = None
-try:
-    import pulp
-except Exception:
-    pulp = None
+# import modularized helpers
+from canny_utils import load_and_prepare_mask, make_minimap_display
+from planning import (build_grid_graph_from_mask, find_nearest_node,
+                      shortcut_and_simplify, convexify_points, line_free_between_points,
+                      solve_shortest_path_ilp, solve_shortest_path_graph,
+                      solve_shortest_path_dijkstra, rrt_local)
+from sensors import get_lidar_distances, swept_collision_check, perimeter_collision_check
+from static_objects import place_random_static_objects
 
-class StaticObject:
-    """Base class for any static object placed in the map."""
-    def __init__(self, space, color=(180, 180, 180)):
-        self.space = space
-        self.color = color
-        self.body = space.static_body   # all static objects share the static body
-        self.shape = None
+# ------------------------ main simulation (modified to integrate patches) ------------------------
+DEBUG_PLANNING = True  # Enable verbose planning diagnostics to understand why plans fail
 
-    def render(self, surface, camera):
-        """Override per shape."""
-        pass
-
-    def render_minimap(self, surface, scale):
-        """Override per shape."""
-        pass
-class StaticRectangle(StaticObject):
-    def __init__(self, space, x, y, width, height, angle=0.0, color=(180, 150, 80)):
-        super().__init__(space, color)
-        
-        # Create Pymunk Poly
-        rect = pymunk.Poly.create_box(self.body, (width, height))
-        rect.body.position = (x, y)
-        rect.body.angle = angle
-        rect.elasticity = 0.1
-        rect.friction = 0.9
-        
-        self.shape = rect
-        space.add(rect)
-
-        self.w = width
-        self.h = height
-        self.angle = angle
-
-    def render(self, surface, camera):
-        x, y = self.shape.body.position
-        sx, sy = camera.world_to_screen((x, y))
-        w = self.w * camera.zoom
-        h = self.h * camera.zoom
-
-        rect = pygame.Surface((w, h), pygame.SRCALPHA)
-        rect.fill(self.color)
-        rect = pygame.transform.rotate(rect, -math.degrees(self.shape.body.angle))
-
-        surface.blit(rect, (sx - rect.get_width() // 2,
-                            sy - rect.get_height() // 2))
-
-    def render_minimap(self, surface, scale):
-        x, y = self.shape.body.position
-        w = self.w // scale
-        h = self.h // scale
-        pygame.draw.rect(surface, self.color,
-                         pygame.Rect(int(x // scale), int(y // scale), w, h))
-        
-class StaticCircle(StaticObject):
-    def __init__(self, space, x, y, radius, color=(200, 80, 80)):
-        super().__init__(space, color)
-
-        circle = pymunk.Circle(self.body, radius)
-        circle.body.position = (x, y)
-        circle.elasticity = 0.1
-        circle.friction = 0.9
-        
-        self.shape = circle
-        space.add(circle)
-
-        self.radius = radius
-
-    def render(self, surface, camera):
-        x, y = self.shape.body.position
-        sx, sy = camera.world_to_screen((x, y))
-        r = int(self.radius * camera.zoom)
-        pygame.draw.circle(surface, self.color, (int(sx), int(sy)), r)
-
-    def render_minimap(self, surface, scale):
-        x, y = self.shape.body.position
-        r = self.radius // scale
-        pygame.draw.circle(surface, self.color,
-                           (int(x // scale), int(y // scale)), int(r))
-
-
-# ------------------------ utilities ------------------------
-def load_and_prepare_mask(image_path: Path, world_w: int, world_h: int, low: int, high: int):
-    """
-    Load image, compute Canny edges, dilate to produce walls binary (walls_bin),
-    create pygame surfaces/masks for full-resolution display and collision checking.
-    Returns: wall_mask (pygame.Mask), wall_surf (RGBA surface for overlay), display_surf (RGB)
-    and walls_bin (uint8 0/255)
-    """
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise FileNotFoundError(f"Could not load image: {image_path}")
-    img = cv2.resize(img, (world_w, world_h))
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(gray, low, high)
-
-    kernel = np.ones((3, 3), np.uint8)
-    walls = cv2.dilate(edges, kernel, iterations=2)
-
-    h, w = walls.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 0] = walls
-    rgba[:, :, 1] = walls
-    rgba[:, :, 2] = walls
-    rgba[:, :, 3] = walls
-    wall_surf = pygame.image.frombuffer(rgba.tobytes(), (w, h), 'RGBA')
-    wall_mask = pygame.mask.from_surface(wall_surf)
-
-    # displayable background (dimmed original + green walls highlight)
-    color_edges = np.zeros_like(img)
-    color_edges[:, :, 1] = walls
-    dimmed = (img * 0.4).astype(np.uint8)
-    display = cv2.add(dimmed, color_edges)
-    display_surf = pygame.image.frombuffer(cv2.cvtColor(display, cv2.COLOR_BGR2RGB).tobytes(), (w, h), 'RGB')
-
-    walls_bin = (walls > 0).astype(np.uint8) * 255
-    return wall_mask, wall_surf, display_surf, walls_bin
-
-def downsample_occupancy_maxpool(walls_bin: np.ndarray, minimap_w: int, minimap_h: int) -> np.ndarray:
-    """
-    Downsample binary occupancy (walls_bin 0/255) using max-pooling so thin walls are preserved.
-    Returns a minimap-sized binary image (0/255).
-    """
-    world_h, world_w = walls_bin.shape
-    # Choose integer pooling factors so output fits nicely
-    # We compute scale factors (pool sizes) to cover world -> minimap
-    pool_x = max(1, math.ceil(world_w / minimap_w))
-    pool_y = max(1, math.ceil(world_h / minimap_h))
-    pool = max(pool_x, pool_y)  # use square blocks for simplicity
-
-    # Dilate with a pool x pool kernel to propagate walls within each block, then sample
-    kernel = np.ones((pool, pool), np.uint8)
-    pooled = cv2.dilate(walls_bin, kernel, iterations=1)
-
-    # Now sample pooled into minimap size using nearest/area sampling which won't blur walls
-    mini = cv2.resize(pooled, (minimap_w, minimap_h), interpolation=cv2.INTER_NEAREST)
-    # ensure binary 0/255
-    mini = (mini > 0).astype(np.uint8) * 255
-    return mini
-
-def make_minimap_display(bg_display: np.ndarray, walls_bin: np.ndarray, minimap_w: int, minimap_h: int):
-    """
-    Create a minimap RGB surface for display:
-     - downsample the full-res background image (bg_display) to minimap using INTER_AREA
-     - compute pooled walls via maxpool and overlay green highlights
-    Returns pygame.Surface RGB (minimap_w x minimap_h) and pooled walls binary (minimap-sized)
-    """
-    # bg_display is RGB numpy (H,W,3)
-    mini_bg = cv2.resize(cv2.cvtColor(bg_display, cv2.COLOR_BGR2RGB), (minimap_w, minimap_h), interpolation=cv2.INTER_AREA)
-    pooled = downsample_occupancy_maxpool(walls_bin, minimap_w, minimap_h)
-    # overlay green walls
-    overlay = mini_bg.copy()
-    mask_idx = pooled > 0
-    overlay[mask_idx, 0] = overlay[mask_idx, 0] * 0.4  # dim red
-    overlay[mask_idx, 1] = 255  # highlight green
-    surf = pygame.image.frombuffer(overlay.tobytes(), (minimap_w, minimap_h), 'RGB')
-    return surf, pooled
-
-# ------------------------ grid graph & planning ------------------------
-def build_grid_graph_from_mask(wall_mask: pygame.mask.Mask,
-                               world_w: int, world_h: int,
-                               grid_step: int = 16) -> Tuple[Dict[Tuple[int, int], int], List[Tuple[int, int, float]]]:
-    """
-    Build grid nodes sampled on full-resolution world (using wall_mask to skip nodes inside walls).
-    """
-    node_id: Dict[Tuple[int, int], int] = {}
-    id_counter = 0
-    for y in range(grid_step // 2, world_h, grid_step):
-        for x in range(grid_step // 2, world_w, grid_step):
-            px = min(world_w - 1, x)
-            py = min(world_h - 1, y)
-            if wall_mask.get_at((px, py)) == 0:
-                node_id[(px, py)] = id_counter
-                id_counter += 1
-
-    edges = []
-    offsets = [(grid_step, 0), (0, grid_step), (-grid_step, 0), (0, -grid_step),
-               (grid_step, grid_step), (grid_step, -grid_step), (-grid_step, grid_step), (-grid_step, -grid_step)]
-    for (x, y), uid in list(node_id.items()):
-        for dx, dy in offsets:
-            nx_coord = (x + dx, y + dy)
-            if nx_coord in node_id:
-                vid = node_id[nx_coord]
-                w = math.hypot(dx, dy)
-                edges.append((uid, vid, w))
-    return node_id, edges
-
-def find_nearest_node(coord_to_id: Dict[Tuple[int, int], int], point: Tuple[float, float]) -> Tuple[Tuple[int, int], int]:
-    best = None
-    best_id = None
-    best_d = float('inf')
-    px, py = point
-    for (x, y), nid in coord_to_id.items():
-        d = (x - px) ** 2 + (y - py) ** 2
-        if d < best_d:
-            best_d = d
-            best = (x, y)
-            best_id = nid
-    return best, best_id
-
-def solve_shortest_path_ilp(coord_to_id: Dict[Tuple[int, int], int],
-                            edges: List[Tuple[int, int, float]],
-                            start_id: int, goal_id: int) -> List[int]:
-    if pulp is None:
-        return []
-    prob = pulp.LpProblem('shortest_path', pulp.LpMinimize)
-    x_vars = {}
-    for i, (u, v, w) in enumerate(edges):
-        x_vars[i] = pulp.LpVariable(f'x_{i}', cat='Binary')
-    prob += pulp.lpSum([w * x_vars[i] for i, (_, _, w) in enumerate(edges)])
-
-    node_count = len(coord_to_id)
-    node_in = {nid: [] for nid in range(node_count)}
-    node_out = {nid: [] for nid in range(node_count)}
-    for i, (u, v, w) in enumerate(edges):
-        node_out[u].append(i)
-        node_in[v].append(i)
-
-    for nid in range(node_count):
-        if nid == start_id:
-            prob += pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 1
-        elif nid == goal_id:
-            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) == 1
-        else:
-            prob += pulp.lpSum([x_vars[i] for i in node_in[nid]]) - pulp.lpSum([x_vars[i] for i in node_out[nid]]) == 0
-
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    res = prob.solve(solver)
-    if res != 1:
-        return []
-
-    selected = [i for i in x_vars if pulp.value(x_vars[i]) >= 0.5]
-    adj = {nid: [] for nid in range(node_count)}
-    for i in selected:
-        u, v, w = edges[i]
-        adj[u].append(v)
-
-    path = [start_id]
-    cur = start_id
-    visited = set([cur])
-    while cur != goal_id:
-        if not adj.get(cur):
-            break
-        nxt = adj[cur][0]
-        if nxt in visited:
-            break
-        path.append(nxt)
-        visited.add(nxt)
-        cur = nxt
-    if cur != goal_id:
-        return []
-    return path
-
-def solve_shortest_path_graph(coord_to_id: Dict[Tuple[int, int], int],
-                              edges: List[Tuple[int, int, float]],
-                              start_id: int, goal_id: int) -> List[int]:
-    if nx is None:
-        return []
-    G = nx.DiGraph()
-    for u, v, w in edges:
-        G.add_edge(u, v, weight=w)
-    try:
-        node_path = nx.shortest_path(G, source=start_id, target=goal_id, weight='weight')
-        return node_path
-    except Exception:
-        return []
-
-# ------------------------ geometry helpers ------------------------
-def line_free_between_points(p1: Tuple[float, float], p2: Tuple[float, float],
-                             wall_mask: pygame.mask.Mask, world_w: int, world_h: int) -> bool:
-    """
-    Conservative raster-sampled line-of-sight test against full-res wall_mask.
-    """
-    x1, y1 = p1
-    x2, y2 = p2
-    steps = max(int(math.hypot(x2 - x1, y2 - y1)), 1)
-    for i in range(0, steps + 1):
-        t = i / steps
-        ix = int(round(x1 + (x2 - x1) * t))
-        iy = int(round(y1 + (y2 - y1) * t))
-        if ix < 0 or iy < 0 or ix >= world_w or iy >= world_h:
-            return False
-        if wall_mask.get_at((ix, iy)):
-            return False
-    return True
-
-def convexify_points(points: List[Tuple[float, float]]) -> List[Tuple[int, int]]:
-    pts = [(float(x), float(y)) for (x, y) in points]
-    pts = sorted(set(pts))
-    if len(pts) <= 2:
-        return [(int(round(x)), int(round(y))) for x, y in pts]
-
-    def cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower = []
-    for p in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    upper = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    hull = lower[:-1] + upper[:-1]
-    return [(int(round(x)), int(round(y))) for x, y in hull]
-
-def shortcut_and_simplify(path_coords: List[Tuple[int, int]],
-                          wall_mask: pygame.mask.Mask, world_w: int, world_h: int) -> List[Tuple[int, int]]:
-    if not path_coords:
-        return []
-    simplified = [path_coords[0]]
-    i = 0
-    n = len(path_coords)
-    while i < n - 1:
-        far = i + 1
-        for j in range(n - 1, i, -1):
-            if line_free_between_points(path_coords[i], path_coords[j], wall_mask, world_w, world_h):
-                far = j
-                break
-        simplified.append(path_coords[far])
-        i = far
-    out = []
-    for p in simplified:
-        if not out or out[-1] != p:
-            out.append(p)
-    return out
-
-# ------------------------ LIDAR ------------------------
-def get_lidar_distances(x: float, y: float, heading: float, mask: pygame.mask.Mask,
-                        world_size: Tuple[int, int], num_beams: int = 5, max_range: int = 120) -> List[int]:
-    w, h = world_size
-    half_span = math.pi / 2.0
-    distances = []
-    if num_beams == 1:
-        rel_angles = [0.0]
-    else:
-        rel_angles = [(-half_span) + i * (2 * half_span) / (num_beams - 1) for i in range(num_beams)]
-
-    for rel in rel_angles:
-        angle = heading + rel
-        dx = math.cos(angle)
-        dy = math.sin(angle)
-        dist_hit = max_range
-        for d in range(1, max_range + 1):
-            px = int(round(x + dx * d))
-            py = int(round(y + dy * d))
-            if not (0 <= px < w and 0 <= py < h):
-                dist_hit = d - 1
-                break
-            if mask.get_at((px, py)):
-                dist_hit = d - 1
-                break
-        distances.append(dist_hit)
-    return distances
-
-# ------------------------ main simulation ------------------------
 def run(image_path: Path,
         world_w: int = 1920, world_h: int = 1080,
         win_w: int = 800, win_h: int = 600,
@@ -399,17 +43,92 @@ def run(image_path: Path,
         low: int = 50, high: int = 150):
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption('Canny Walls - Wall-safe Minimap + Convex Planning')
+    pygame.display.set_caption('Canny Walls - Wall-safe Minimap + Convex Planning (patched)')
     clock = pygame.time.Clock()
 
     # full-res wall mask and display image + binary
     wall_mask, wall_surf, bg_surf, walls_bin = load_and_prepare_mask(image_path, world_w, world_h, low, high)
 
+    # compute distance-to-wall map (pixels) for planning clearance checks
+    try:
+        free_mask = (walls_bin == 0).astype('uint8') * 255
+        dist_map = cv2.distanceTransform(free_mask, cv2.DIST_L2, 5)
+    except Exception:
+        dist_map = None
+
+    # ------------------ create unknown static objects (patch 6)
+    # compute allowed mask from background: choose dark-gray room pixels (low-to-mid brightness,
+    # low saturation) so static objects appear in rooms rather than bright hallways
+    try:
+        bg_arr_for_mask = pygame.surfarray.array3d(bg_surf)
+        bg_arr_for_mask = np.transpose(bg_arr_for_mask, (1, 0, 2)).copy()
+        # convert to HSV to better segment gray (low saturation) and moderate/low brightness
+        #RGB limits
+        RED_LOW = 70
+        RED_HIGH = 100
+        BLUE_LOW = 70
+        BLUE_HIGH = 100
+        GREEN_LOW = 70
+        GREEN_HIGH = 100
+        allowed_mask = (bg_arr_for_mask[:,:,0] >= RED_LOW) & (bg_arr_for_mask[:,:,0] <= RED_HIGH) & \
+                        (bg_arr_for_mask[:,:,1] >= GREEN_LOW) & (bg_arr_for_mask[:,:,1] <= GREEN_HIGH) & \
+                        (bg_arr_for_mask[:,:,2] >= BLUE_LOW) & (bg_arr_for_mask[:,:,2] <= BLUE_HIGH)
+    except Exception:
+        allowed_mask = None
+
+    # try to place many small rects (no circles) limited to 2x2 cells
+    static_surf, static_objects = place_random_static_objects((world_w, world_h), wall_mask,
+                                                              num_rect=0, num_circ=800, seed=None,
+                                                              allowed_mask=allowed_mask,
+                                                              grid_cell=1, max_cells=16)
+    static_mask = pygame.mask.from_surface(static_surf)
+
+    # Print coordinates of static objects
+    print("Placed static objects:")
+    for obj in static_objects:
+        print(" ", obj)
+
+    # combined mask used for movement & LIDAR checks (patch 7)
+    # create combined surface by blitting wall_surf (alpha) then static_surf (opaque)
+    combined_surf = pygame.Surface((world_w, world_h), flags=pygame.SRCALPHA)
+    combined_surf.fill((0, 0, 0, 0))
+    # wall_surf uses wall pixels in alpha; draw as white
+    try:
+        # convert wall_surf to a white mask surface
+        ws_arr = pygame.surfarray.array_alpha(wall_surf)
+        wall_white = pygame.Surface((world_w, world_h), flags=pygame.SRCALPHA)
+        wall_white.fill((255, 255, 255, 0))
+        wall_px = pygame.PixelArray(wall_white)
+        # paint alpha>0 pixels white opaque
+        for yy in range(world_h):
+            for xx in range(world_w):
+                if ws_arr[xx, yy] > 0:
+                    wall_px[xx, yy] = (255, 255, 255, 255)
+        del wall_px
+        combined_surf.blit(wall_white, (0, 0))
+    except Exception:
+        # fallback: blit wall_surf directly (should also work since it has alpha)
+        combined_surf.blit(wall_surf, (0, 0))
+    combined_surf.blit(static_surf, (0, 0))
+    combined_mask = pygame.mask.from_surface(combined_surf)
+
+    # build combined binary map (h x w) and distance transform for clearance checks
+    try:
+        # walls_bin is h x w; extract static alpha and transpose to h x w
+        static_alpha = pygame.surfarray.array_alpha(static_surf)
+        static_bin = (np.transpose(static_alpha) > 0).astype(np.uint8) * 255
+        combined_bin = np.maximum(walls_bin, static_bin)
+        free_mask = (combined_bin == 0).astype('uint8') * 255
+        combined_dist_map = cv2.distanceTransform(free_mask, cv2.DIST_L2, 5)
+    except Exception:
+        combined_bin = walls_bin.copy()
+        combined_dist_map = None
+
     # small robot sprite
-    player_w = 4
-    player_h = 4
-    player_x = world_w // 2
-    player_y = world_h // 2
+    player_w = 2
+    player_h = 2
+    player_x = 1542
+    player_y = 900
     speed = 3
 
     player_surf = pygame.Surface((player_w, player_h), flags=pygame.SRCALPHA)
@@ -420,13 +139,27 @@ def run(image_path: Path,
 
     # lidar params (smaller beams)
     num_lidar = 5
-    lidar_max = 120
+    lidar_max = 30
     heading = 0.0
 
     # planning state
-    path_waypoints: List[Tuple[int, int]] = []
+    path_waypoints: List[Tuple[float, float]] = []
     path_index = 0
-    graph_cache = None  # (coord_to_id, edges)
+    pending_replan_after_retreat = False
+    pending_replan_consider_static = False
+    pending_replan_steps = 0
+    consecutive_retreat_count = 0  # Track retreat cycles to prevent infinite loops
+    MAX_CONSECUTIVE_RETREATS = 3
+    graph_cache: dict[Tuple[str, int], Tuple[dict, List[Tuple[int, int, float]]]] = {}
+    inflated_cache: dict[Tuple[str, int], Tuple[pygame.mask.Mask, np.ndarray | None]] = {}
+    current_goal: Tuple[int, int] | None = None
+    frame_count = 0
+    last_replan_frame = -999
+    last_successful_replan_frame = -999
+    # Reduced cooldown to allow more responsive replanning
+    REPLAN_COOLDOWN_FRAMES = 1
+    # Grace period after successful replan to follow the path without interference
+    REPLAN_GRACE_FRAMES = 60  # Increased to 1 second to allow longer paths to execute
 
     show_walls = True
     running = True
@@ -441,11 +174,465 @@ def run(image_path: Path,
     minimap_w = min(240, win_w // 4)
     minimap_h = min(160, win_h // 4)
     minimap_rect = pygame.Rect(win_w - minimap_w - 8, 8, minimap_w, minimap_h)
-    # create minimap surfaces (we'll regenerate each frame to reflect latest walls_bin/bg)
     factor_x = minimap_w / float(world_w)
     factor_y = minimap_h / float(world_h)
 
+    # thresholds (tuned)
+    lidar_replan_threshold = 4     # if lidar sees object closer than this -> replan (reduced from 6)
+    # reduce stopping distance by 2/3 (i.e. keep only 1/3)
+    lidar_stop_threshold = 1       # was 6, now 2
+    swept_samples = 6              # samples for swept collision prediction
+    perimeter_sample_radius = max(2, int(max(player_w, player_h) / 2))  # used for perimeter grazing checks
+
     while running:
+        frame_count += 1
+
+        def ensure_graph(mask_key: str, mask_obj: pygame.mask.Mask, version: int = 0, dist_map_local=None, clearance: int = 0):
+            """Build or reuse a grid graph for the provided mask."""
+            cache_key = (mask_key, version, clearance)
+            if cache_key not in graph_cache:
+                coord_to_id, edges = build_grid_graph_from_mask(mask_obj, world_w, world_h, grid_step=16,
+                                                               dist_map=dist_map_local, clearance=clearance)
+                graph_cache[cache_key] = (coord_to_id, edges)
+            return graph_cache[cache_key]
+
+        def segments_line_free(points: List[Tuple[float, float]], mask_obj: pygame.mask.Mask) -> bool:
+            if len(points) < 2:
+                return True
+            for a, b in zip(points, points[1:]):
+                if not line_free_between_points(a, b, mask_obj, world_w, world_h):
+                    return False
+            return True
+        def try_local_avoidance(desired_heading: float, clearance: int = None, dist_map_local: np.ndarray | None = None) -> bool:
+            """Try small lateral sidesteps to bypass a nearby obstacle.
+            If a candidate sidestep is feasible, prepend it to the current path and return True.
+            Prefer convexified replacement for the route when possible.
+            """
+            nonlocal path_waypoints, path_index, last_successful_replan_frame
+            # Don't interfere with fresh replans - give them time to execute
+            if frame_count - last_successful_replan_frame < REPLAN_GRACE_FRAMES:
+                log(f"local avoid: skipping (grace period active, {frame_count - last_successful_replan_frame} frames since replan)")
+                return False
+            # Reduced lateral choices to avoid extreme sidesteps in narrow corridors
+            lateral_choices = [max(8, player_w * 8), max(16, player_w * 16), max(32, player_w * 32)]
+            if clearance is None:
+                clearance = max(1, int(lidar_replan_threshold))
+            if dist_map_local is None:
+                dist_map_local = combined_dist_map
+            for ld in lateral_choices:
+                for sign in (1, -1):
+                    # perpendicular vector to desired_heading
+                    px = -math.sin(desired_heading)
+                    py = math.cos(desired_heading)
+                    nx_wp = player_x + px * (ld * sign)
+                    ny_wp = player_y + py * (ld * sign)
+                    nx_wp = max(0, min(world_w - player_w, nx_wp))
+                    ny_wp = max(0, min(world_h - player_h, ny_wp))
+                    # quick check: collision-free and swept path OK
+                    if combined_mask.overlap(player_mask, (int(nx_wp), int(ny_wp))) is None and not swept_collision_check((int(player_x), int(player_y)), (int(nx_wp), int(ny_wp)), player_mask, combined_mask, samples=4):
+                        log(f"local avoid: inserting sidestep ({int(nx_wp)},{int(ny_wp)}) lateral={ld*sign}")
+                        # candidate route: sidestep then resume remaining waypoints
+                        remaining = path_waypoints[path_index:] if path_waypoints else []
+                        candidate = [(float(nx_wp), float(ny_wp))] + remaining
+                        # try to convexify the candidate route and accept convex hull if safe
+                        try_hull = convexify_points(candidate)
+                        if len(try_hull) >= 2 and segments_line_free(try_hull, combined_mask) and clearance_sufficient(try_hull, clearance, dist_map_local):
+                            log(f"local avoid: accepting convex hull of sidestep route ({len(try_hull)} pts)")
+                            path_waypoints = [(float(x), float(y)) for x, y in try_hull]
+                            path_index = 0
+                            return True
+                        # fallback: accept the simple sidestep waypoint if it is safe enough
+                        if clearance_sufficient(candidate, clearance, dist_map_local):
+                            path_waypoints = candidate
+                            path_index = 0
+                            return True
+            return False
+
+        def clearance_sufficient(points: List[Tuple[float, float]], clearance: int,
+                                 dist_map_local: np.ndarray | None) -> bool:
+            if dist_map_local is None or not points:
+                return True
+            for a, b in zip(points, points[1:]):
+                steps = max(int(math.hypot(b[0] - a[0], b[1] - a[1])) // 2, 1)
+                for i in range(steps + 1):
+                    t = i / steps
+                    px = a[0] + (b[0] - a[0]) * t
+                    py = a[1] + (b[1] - a[1]) * t
+                    ix = max(0, min(world_w - 1, int(px)))
+                    iy = max(0, min(world_h - 1, int(py)))
+                    if dist_map_local[iy, ix] < clearance:
+                        return False
+            return True
+
+        def log(msg: str) -> None:
+            if DEBUG_PLANNING:
+                print(f"[plan-debug] {msg}")
+
+        def attempt_replan(force: bool = False, consider_static: bool = False, _retreat: bool = False) -> bool:
+            """Try to plan from current player position to `current_goal`.
+
+            Returns True if a new plan was set.
+            _retreat: internal flag to indicate this call is a retreat-attempt and
+                      should not trigger further retreat recursion."""
+            nonlocal path_waypoints, path_index, current_goal, last_replan_frame, last_successful_replan_frame, player_x, player_y, heading
+            nonlocal pending_replan_after_retreat, pending_replan_consider_static, pending_replan_steps, consecutive_retreat_count
+            if not force and not _retreat and frame_count - last_replan_frame < REPLAN_COOLDOWN_FRAMES:
+                log("replan skipped due to cooldown")
+                return False
+            last_replan_frame = frame_count
+            if current_goal is None:
+                log("no current goal set; cannot replan")
+                return False
+            wx, wy = current_goal
+            log(f"attempt_replan(force={force}, consider_static={consider_static}) goal=({wx},{wy})")
+
+            required_clearance = max(1, int(lidar_replan_threshold))
+            # If this is the initial plan (no existing waypoints), be permissive
+            # and use a much smaller clearance so the planner can find an initial route
+            # even through narrow corridors. Static objects are still ignored when
+            # consider_static=False.
+            if not path_waypoints and not consider_static:
+                log("initial plan: using reduced clearance for planning")
+                required_clearance = 1
+
+            mask_configs: dict[str, dict[str, object]] = {
+                'walls': {
+                    'mask': wall_mask,
+                    'dist_map': dist_map,
+                    'bin': walls_bin,
+                    'version': 0,
+                },
+                'combined': {
+                    'mask': combined_mask,
+                    'dist_map': combined_dist_map,
+                    'bin': combined_bin,
+                    'version': 0,
+                },
+            }
+
+            def get_inflated_mask(base_key: str) -> Tuple[pygame.mask.Mask | None, np.ndarray | None]:
+                cache_key = (base_key, required_clearance)
+                if cache_key in inflated_cache:
+                    return inflated_cache[cache_key]
+                base_info = mask_configs.get(base_key)
+                if base_info is None:
+                    return None, None
+                base_bin = base_info.get('bin')
+                if base_bin is None:
+                    return None, None
+                try:
+                    kernel = max(1, required_clearance * 2 + 1)
+                    inflated = cv2.dilate(base_bin, np.ones((kernel, kernel), np.uint8), iterations=1)
+                    h_inf, w_inf = inflated.shape
+                    rgba = np.zeros((h_inf, w_inf, 4), dtype=np.uint8)
+                    rgba[:, :, 0] = inflated
+                    rgba[:, :, 1] = inflated
+                    rgba[:, :, 2] = inflated
+                    rgba[:, :, 3] = inflated
+                    surf = pygame.image.frombuffer(rgba.tobytes(), (w_inf, h_inf), 'RGBA')
+                    mask_local = pygame.mask.from_surface(surf)
+                    free_mask_inf = (inflated == 0).astype('uint8') * 255
+                    dist_map_inf = cv2.distanceTransform(free_mask_inf, cv2.DIST_L2, 5)
+                    inflated_cache[cache_key] = (mask_local, dist_map_inf)
+                    return inflated_cache[cache_key]
+                except Exception:
+                    return None, None
+
+            base_key = 'combined' if consider_static else 'walls'
+            candidate_configs: List[dict[str, object]] = []
+
+            base_info = mask_configs.get(base_key)
+            if base_info and base_info.get('mask') is not None:
+                candidate_configs.append({
+                    'key': base_key,
+                    'mask': base_info['mask'],
+                    'dist_map': base_info.get('dist_map'),
+                    'version': base_info.get('version', 0),
+                })
+
+            inflated_mask_obj, inflated_dist_map = get_inflated_mask(base_key)
+            if inflated_mask_obj is not None:
+                candidate_configs.append({
+                    'key': f'{base_key}_inflated',
+                    'mask': inflated_mask_obj,
+                    'dist_map': inflated_dist_map,
+                    'version': required_clearance,
+                })
+
+            best_points: List[Tuple[int, int]] = []
+
+            for cfg in candidate_configs:
+                mask_key = cfg['key']
+                mask_obj = cfg['mask']
+                dist_map_local = cfg['dist_map']
+                version = cfg['version']
+
+                if mask_obj is None:
+                    log(f"mask={mask_key} missing mask; skipping")
+                    continue
+
+                coord_to_id, edges = ensure_graph(mask_key, mask_obj, int(version), dist_map_local, int(version))
+                start_world = (player_x + player_w / 2.0, player_y + player_h / 2.0)
+                start_coord, start_id = find_nearest_node(coord_to_id, start_world)
+                goal_coord, goal_id = find_nearest_node(coord_to_id, (wx, wy))
+                log(f"mask={mask_key} start_world={start_world} nearest_start={start_coord} (id={start_id}) nearest_goal={goal_coord} (id={goal_id}) required_clearance={required_clearance}")
+
+                def sample_min_dist(points: List[Tuple[float, float]]) -> Tuple[float, List[Tuple[int, int, float]]]:
+                    """Return min distance along polyline and list of sampled points with their distances."""
+                    if dist_map_local is None or not points:
+                        return float('inf'), []
+                    mins = float('inf')
+                    below = []
+                    for a, b in zip(points, points[1:]):
+                        steps = max(int(math.hypot(b[0] - a[0], b[1] - a[1])) // 2, 1)
+                        for i in range(steps + 1):
+                            t = i / steps
+                            px = int(max(0, min(world_w - 1, int(a[0] + (b[0] - a[0]) * t))))
+                            py = int(max(0, min(world_h - 1, int(a[1] + (b[1] - a[1]) * t))))
+                            d = float(dist_map_local[py, px])
+                            if d < mins:
+                                mins = d
+                            if d < required_clearance:
+                                below.append((px, py, d))
+                    return mins, below
+                if start_id is None or goal_id is None:
+                    log(f"mask={mask_key} missing start/goal nodes (start={start_id}, goal={goal_id}); skipping")
+                    continue
+
+                log(
+                    f"mask={mask_key} version={version} nodes={len(coord_to_id)} "
+                    f"edges={len(edges)} start_id={start_id} goal_id={goal_id}"
+                )
+
+                planned_ids_local: List[int] = []
+                solver_used = None
+                try:
+                    planned_ids_local = solve_shortest_path_ilp(coord_to_id, edges, start_id, goal_id)
+                    if planned_ids_local:
+                        solver_used = 'ILP'
+                except Exception as exc:
+                    log(f"mask={mask_key} ILP solver raised {exc.__class__.__name__}; falling back")
+                    planned_ids_local = []
+
+                if not planned_ids_local:
+                    planned_ids_local = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
+                    if planned_ids_local:
+                        solver_used = 'networkx'
+
+                if not planned_ids_local:
+                    planned_ids_local = solve_shortest_path_dijkstra(coord_to_id, edges, start_id, goal_id)
+                    if planned_ids_local:
+                        solver_used = 'dijkstra'
+
+                if not planned_ids_local:
+                    log(f"mask={mask_key} no path from any solver; trying next candidate")
+                    continue
+
+                log(f"mask={mask_key} {solver_used} path length={len(planned_ids_local)}")
+                id_to_coord = {nid: coord for coord, nid in coord_to_id.items()}
+                waypoints_local = [id_to_coord[nid] for nid in planned_ids_local]
+                mins_orig, below_orig = sample_min_dist(waypoints_local)
+                log(f"mask={mask_key} original path min_dist={mins_orig} samples_below={len(below_orig)}")
+                if below_orig:
+                    log(f"mask={mask_key} sample below clearance (orig) example={below_orig[0]}")
+                simplified_local = shortcut_and_simplify(waypoints_local, mask_obj, world_w, world_h, dist_map_local, required_clearance)
+                mins_simpl, below_simpl = sample_min_dist(simplified_local)
+                log(f"mask={mask_key} simplified path min_dist={mins_simpl} samples_below={len(below_simpl)}")
+                if below_simpl:
+                    log(f"mask={mask_key} sample below clearance (simplified) example={below_simpl[0]}")
+                if len(simplified_local) != len(waypoints_local):
+                    log(
+                        f"mask={mask_key} simplified path {len(waypoints_local)} -> {len(simplified_local)} points"
+                    )
+                if len(simplified_local) != len(waypoints_local):
+                    log(
+                        f"mask={mask_key} simplified path {len(waypoints_local)} -> {len(simplified_local)} points"
+                    )
+                hull_local = convexify_points(simplified_local)
+
+                chosen_points: List[Tuple[int, int]] = []
+                if len(hull_local) >= 2:
+                    if segments_line_free(hull_local, mask_obj):
+                        if clearance_sufficient(hull_local, required_clearance, dist_map_local):
+                            log(f"mask={mask_key} accepted convex hull with {len(hull_local)} points")
+                            chosen_points = hull_local
+                        else:
+                            log(f"mask={mask_key} convex hull failed clearance check")
+                    else:
+                        log(f"mask={mask_key} convex hull blocked by obstacles")
+                else:
+                    log(f"mask={mask_key} convex hull insufficient points ({len(hull_local)})")
+
+                if not chosen_points:
+                    if segments_line_free(simplified_local, mask_obj):
+                        if clearance_sufficient(simplified_local, required_clearance, dist_map_local):
+                            log(f"mask={mask_key} accepted simplified path with {len(simplified_local)} points")
+                            chosen_points = simplified_local
+                        else:
+                            # Pragmatic fallback: if clearance is strict (>3) and simplified path is collision-free,
+                            # accept it with relaxed clearance requirement (half of required)
+                            relaxed_clearance = max(1, required_clearance // 2)
+                            if required_clearance > 3 and clearance_sufficient(simplified_local, relaxed_clearance, dist_map_local):
+                                log(f"mask={mask_key} accepted simplified path with relaxed clearance ({relaxed_clearance}) - {len(simplified_local)} points")
+                                chosen_points = simplified_local
+                            else:
+                                log(f"mask={mask_key} simplified path failed clearance; rejecting")
+                    else:
+                        log(f"mask={mask_key} simplified path blocked; rejecting")
+
+                if chosen_points:
+                    best_points = chosen_points
+                    break
+                else:
+                    log(f"mask={mask_key} rejected; evaluating next candidate")
+
+            if not best_points:
+                log("planning failed; no candidate produced a valid path")
+                # As a last-resort, try a local RRT detour in world coords (not graph-based).
+                # This is useful when inflated/combined graphs are disconnected but a
+                # short local detour may exist.
+                if consider_static:
+                    try:
+                        log("attempting local RRT detour as last-resort")
+                        start_world = (player_x + player_w / 2.0, player_y + player_h / 2.0)
+                        # Use very relaxed clearance for RRT to allow narrow passages (just 1 pixel)
+                        rrt_clearance = 1
+                        rrt_path = rrt_local(start_world, (wx, wy), combined_mask, world_w, world_h,
+                                             dist_map=combined_dist_map, clearance=rrt_clearance,
+                                             step=24, max_iters=4000, goal_tolerance=32, sample_margin=256)
+                        if rrt_path:
+                            log(f"RRT produced path with {len(rrt_path)} pts; trying to accept")
+                            simplified_rrt = shortcut_and_simplify(rrt_path, combined_mask, world_w, world_h, combined_dist_map, rrt_clearance)
+                            hull_rrt = convexify_points(simplified_rrt)
+                            # Try convex hull first
+                            if len(hull_rrt) >= 2 and segments_line_free(hull_rrt, combined_mask):
+                                if clearance_sufficient(hull_rrt, rrt_clearance, combined_dist_map):
+                                    log(f"RRT: accepting convex hull with {len(hull_rrt)} points")
+                                    best_points = hull_rrt
+                                else:
+                                    log("RRT: convex hull failed clearance")
+                            # Fallback to simplified path
+                            if not best_points and segments_line_free(simplified_rrt, combined_mask):
+                                if clearance_sufficient(simplified_rrt, rrt_clearance, combined_dist_map):
+                                    log(f"RRT: accepting simplified path with {len(simplified_rrt)} points")
+                                    best_points = simplified_rrt
+                                else:
+                                    log("RRT: simplified path failed clearance")
+                            # Last resort: accept any collision-free path from RRT
+                            if not best_points and len(rrt_path) >= 2:
+                                log(f"RRT: accepting raw path as last resort with {len(rrt_path)} points")
+                                best_points = rrt_path
+                        else:
+                            log("RRT: failed to find any path")
+                    except Exception as exc:
+                        log(f"RRT detour raised {exc.__class__.__name__}: {exc}; skipping")
+                # If we're trying to consider static obstacles and planning failed,
+                # attempt a small retreat (back up) to increase clearance and retry once.
+                # Only retreat if RRT also failed (best_points still empty).
+                if consider_static and not _retreat and not best_points and consecutive_retreat_count < MAX_CONSECUTIVE_RETREATS:
+                    # Try retreat with smaller steps to avoid oscillation
+                    retreat_steps = [12, 24, 48]
+                    lateral_factors = [0.0]  # No lateral retreat to avoid getting stuck in corners
+                    attempted = False
+                    for d in retreat_steps:
+                        for lf in lateral_factors:
+                            # compute candidate retreat point: back along heading, plus lateral offset
+                            try:
+                                bx = -math.cos(heading)
+                                by = -math.sin(heading)
+                                # perpendicular to heading (to the left)
+                                px = -by
+                                py = bx
+                                rx = player_x + bx * d + px * (lf * d)
+                                ry = player_y + by * d + py * (lf * d)
+                            except Exception:
+                                rx = player_x
+                                ry = player_y
+                            rx = max(0, min(world_w - player_w, rx))
+                            ry = max(0, min(world_h - player_h, ry))
+                            # check retreat is collision-free against combined mask
+                            overlap = combined_mask.overlap(player_mask, (int(rx), int(ry)))
+                            swept_ok = not swept_collision_check((int(player_x), int(player_y)), (int(rx), int(ry)), player_mask, combined_mask, samples=4)
+                            attempted = True
+                            log(f"retreat candidate d={d} lateral={lf} -> ({int(rx)},{int(ry)}) overlap={overlap is not None} swept_ok={swept_ok}")
+                            if overlap is None and swept_ok:
+                                log(f"retreat candidate accepted -> enqueue retreat to ({int(rx)},{int(ry)}) and retry after driving back")
+                                consecutive_retreat_count += 1
+                                log(f"retreat count: {consecutive_retreat_count}/{MAX_CONSECUTIVE_RETREATS}")
+                                # enqueue a short driving retreat (interpolated waypoints) instead of teleporting
+                                retreat_steps_n = max(2, int(d // max(1, speed)))
+                                retreat_pts: List[Tuple[float, float]] = []
+                                for tval in [0.33, 0.66, 1.0][:retreat_steps_n]:
+                                    rx_t = player_x + (rx - player_x) * tval
+                                    ry_t = player_y + (ry - player_y) * tval
+                                    retreat_pts.append((float(rx_t), float(ry_t)))
+                                # prepend retreat waypoints to current path (so robot will drive back)
+                                path_waypoints = retreat_pts + path_waypoints[path_index:]
+                                path_index = 0
+                                # schedule a replan after retreat completes
+                                pending_replan_after_retreat = True
+                                pending_replan_consider_static = consider_static
+                                pending_replan_steps = len(retreat_pts)
+                                graph_cache.clear()
+                                return True
+                    if attempted:
+                        log("retreat attempts exhausted; cannot increase clearance")
+                elif consider_static and consecutive_retreat_count >= MAX_CONSECUTIVE_RETREATS:
+                    log(f"max consecutive retreats ({MAX_CONSECUTIVE_RETREATS}) reached; trying lidar-guided exploration")
+                    # Last resort: move toward the LIDAR direction with the farthest obstacle
+                    # to explore open space and try to get back on track
+                    world_center_x = player_x + player_w / 2.0
+                    world_center_y = player_y + player_h / 2.0
+                    lidar_scan = get_lidar_distances(world_center_x, world_center_y, heading,
+                                                     wall_mask, static_mask, (world_w, world_h),
+                                                     num_beams=num_lidar, max_range=lidar_max)
+                    if lidar_scan:
+                        # Find the beam with maximum distance (most open space)
+                        max_dist = max(lidar_scan)
+                        max_idx = lidar_scan.index(max_dist)
+                        # Compute angle for that beam
+                        half_span = math.pi / 2.0
+                        rel_angle = (-half_span) + max_idx * (2 * half_span) / (num_lidar - 1)
+                        explore_heading = heading + rel_angle
+                        # Move a moderate distance in that direction
+                        explore_dist = min(max_dist * 0.7, 80)  # 70% of free space or 80 pixels max
+                        explore_x = world_center_x + math.cos(explore_heading) * explore_dist
+                        explore_y = world_center_y + math.sin(explore_heading) * explore_dist
+                        explore_x = max(0, min(world_w - player_w, explore_x))
+                        explore_y = max(0, min(world_h - player_h, explore_y))
+                        # Check if exploration waypoint is collision-free
+                        if combined_mask.overlap(player_mask, (int(explore_x), int(explore_y))) is None:
+                            if not swept_collision_check((int(player_x), int(player_y)), (int(explore_x), int(explore_y)),
+                                                         player_mask, combined_mask, samples=6):
+                                log(f"lidar-guided: moving toward open space at bearing {math.degrees(explore_heading):.1f}° (beam {max_idx}, dist={max_dist:.1f})")
+                                # Create waypoints to explore toward open space, then try to resume goal
+                                explore_steps = max(2, int(explore_dist // max(1, speed)))
+                                explore_pts: List[Tuple[float, float]] = []
+                                for tval in [0.33, 0.66, 1.0][:explore_steps]:
+                                    ex_t = player_x + (explore_x - player_x) * tval
+                                    ey_t = player_y + (explore_y - player_y) * tval
+                                    explore_pts.append((float(ex_t), float(ey_t)))
+                                path_waypoints = explore_pts
+                                path_index = 0
+                                # Reset retreat counter to allow future retries after exploration
+                                consecutive_retreat_count = 0
+                                # Schedule a replan after exploration completes
+                                pending_replan_after_retreat = True
+                                pending_replan_consider_static = consider_static
+                                pending_replan_steps = len(explore_pts)
+                                log(f"lidar-guided: scheduled replan after {len(explore_pts)} exploration waypoints")
+                                return True
+                        log("lidar-guided: exploration waypoint blocked; giving up on this goal")
+                path_waypoints = []
+                path_index = 0
+                return False
+
+            log(f"planning succeeded with {len(best_points)} waypoints")
+            path_waypoints = [(float(x), float(y)) for x, y in best_points]
+            path_index = 0
+            last_successful_replan_frame = frame_count  # Mark successful replan for grace period
+            consecutive_retreat_count = 0  # Reset retreat counter on successful plan
+            return True
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -456,54 +643,15 @@ def run(image_path: Path,
                     show_walls = not show_walls
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
-                # convert click to world coords via minimap mapping (minimap shows pooled walls so user sees preserved walls)
                 if minimap_rect.collidepoint((mx, my)):
-                    # world coords mapped proportionally
                     wx = int((mx - minimap_rect.x) / minimap_w * world_w)
                     wy = int((my - minimap_rect.y) / minimap_h * world_h)
-
-                    # build graph from full-res wall_mask (ensures obstacles in full-res are considered)
-                    if graph_cache is None:
-                        coord_to_id, edges = build_grid_graph_from_mask(wall_mask, world_w, world_h, grid_step=16)
-                        graph_cache = (coord_to_id, edges)
-                    else:
-                        coord_to_id, edges = graph_cache
-
-                    start_coord, start_id = find_nearest_node(coord_to_id, (player_x, player_y))
-                    goal_coord, goal_id = find_nearest_node(coord_to_id, (wx, wy))
-
-                    planned_ids: List[int] = []
-                    if pulp is not None and start_id is not None and goal_id is not None:
-                        planned_ids = solve_shortest_path_ilp(coord_to_id, edges, start_id, goal_id)
-                    if not planned_ids and nx is not None and start_id is not None and goal_id is not None:
-                        planned_ids = solve_shortest_path_graph(coord_to_id, edges, start_id, goal_id)
-
-                    if planned_ids:
-                        id_to_coord = {nid: coord for coord, nid in coord_to_id.items()}
-                        waypoints = [id_to_coord[nid] for nid in planned_ids]
-
-                        # simplify via LOS on full-res mask
-                        simplified = shortcut_and_simplify(waypoints, wall_mask, world_w, world_h)
-
-                        # attempt convex hull of simplified points but only accept if hull edges are free on full-res mask
-                        hull = convexify_points(simplified)
-                        hull_ok = True
-                        if len(hull) >= 2:
-                            for i in range(len(hull)):
-                                a = hull[i]
-                                b = hull[(i + 1) % len(hull)]
-                                if not line_free_between_points(a, b, wall_mask, world_w, world_h):
-                                    hull_ok = False
-                                    break
-                        else:
-                            hull_ok = False
-
-                        if hull_ok and len(hull) >= 2:
-                            path_waypoints = hull
-                            path_index = 0
-                        else:
-                            path_waypoints = simplified
-                            path_index = 0
+                    current_goal = (wx, wy)
+                    planned = attempt_replan(force=True, consider_static=False)
+                    if not planned:
+                        path_waypoints = []
+                        path_index = 0
+                        graph_cache.clear()
 
         # manual input
         keys = pygame.key.get_pressed()
@@ -527,23 +675,35 @@ def run(image_path: Path,
         tentative_x = max(0, min(world_w - player_w, tentative_x))
         tentative_y = max(0, min(world_h - player_h, tentative_y))
 
-        overlap = wall_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
+        # use combined_mask for manual collision checks (patch 7)
+        overlap = combined_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
         if overlap is None:
-            if move_dx != 0 or move_dy != 0:
-                heading = math.atan2(move_dy, move_dx) if (move_dx != 0 or move_dy != 0) else heading
-            player_x = tentative_x
-            player_y = tentative_y
-        else:
-            overlap_x = wall_mask.overlap(player_mask, (int(tentative_x), int(player_y)))
-            overlap_y = wall_mask.overlap(player_mask, (int(player_x), int(tentative_y)))
-            if overlap_x is None:
+            # also check swept collision from current to tentative (patch 8)
+            if swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(tentative_y)),
+                                     player_mask, combined_mask, samples=swept_samples):
+                # predicted collision: do not move
+                pass
+            else:
+                if move_dx != 0 or move_dy != 0:
+                    heading = math.atan2(move_dy, move_dx) if (move_dx != 0 or move_dy != 0) else heading
                 player_x = tentative_x
-                if move_dx != 0:
-                    heading = math.atan2(0, move_dx)
-            if overlap_y is None:
                 player_y = tentative_y
-                if move_dy != 0:
-                    heading = math.atan2(move_dy, 0)
+        else:
+            overlap_x = combined_mask.overlap(player_mask, (int(tentative_x), int(player_y)))
+            overlap_y = combined_mask.overlap(player_mask, (int(player_x), int(tentative_y)))
+            if overlap_x is None:
+                # swept check for x-only
+                if not swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(player_y)),
+                                             player_mask, combined_mask, samples=swept_samples):
+                    player_x = tentative_x
+                    if move_dx != 0:
+                        heading = math.atan2(0, move_dx)
+            if overlap_y is None:
+                if not swept_collision_check((int(player_x), int(player_y)), (int(player_x), int(tentative_y)),
+                                             player_mask, combined_mask, samples=swept_samples):
+                    player_y = tentative_y
+                    if move_dy != 0:
+                        heading = math.atan2(move_dy, 0)
 
         # path following
         if path_waypoints and path_index < len(path_waypoints):
@@ -553,40 +713,123 @@ def run(image_path: Path,
             dist = math.hypot(vx, vy)
             if dist < 2.0:
                 path_index += 1
+                # if we were performing a retreat, once retreat waypoints are consumed,
+                # trigger the scheduled replan to compute a static-aware path
+                if pending_replan_after_retreat and path_index >= pending_replan_steps:
+                    pending_replan_after_retreat = False
+                    log("retreat completed; attempting static-aware replan")
+                    replanned = attempt_replan(force=True, consider_static=pending_replan_consider_static)
+                    if not replanned:
+                        log("post-retreat replan failed; will attempt local avoidance on next tick")
             else:
+                # slow down as approaching waypoint (patch 9 not requested, but helpful)
+                step_speed = speed
+                if dist < 12:
+                    step_speed = max(1.0, speed * (dist / 12.0))
+
                 desired_heading = math.atan2(vy, vx)
-                step_x = (vx / dist) * speed
-                step_y = (vy / dist) * speed
+                step_x = (vx / dist) * step_speed
+                step_y = (vy / dist) * step_speed
 
                 world_center_x = player_x + player_w / 2.0
                 world_center_y = player_y + player_h / 2.0
+
+                # LIDAR checks against walls AND static objects (patch 2,6,7)
                 lidar = get_lidar_distances(world_center_x, world_center_y, desired_heading,
-                                            wall_mask, (world_w, world_h), num_beams=num_lidar, max_range=lidar_max)
+                                            wall_mask, static_mask, (world_w, world_h),
+                                            num_beams=num_lidar, max_range=lidar_max)
+                # if front is very close, either stop or replan (patch 2 & 4)
                 mid = len(lidar) // 2
                 front_slice = lidar[max(0, mid-1): min(len(lidar), mid+2)]
-                if min(front_slice) < 8:
+                min_front = min(front_slice) if front_slice else lidar[mid]
+                # During grace period, trust the fresh plan and be less sensitive to LIDAR warnings
+                in_grace_period = (frame_count - last_successful_replan_frame < REPLAN_GRACE_FRAMES)
+                effective_stop_threshold = lidar_stop_threshold if not in_grace_period else 0  # No LIDAR stops during grace
+                effective_replan_threshold = lidar_replan_threshold if not in_grace_period else 2  # Very close only during grace
+                
+                if min_front <= effective_stop_threshold:
+                    # immediate stop: do not advance, but KEEP the current goal so replanning can continue
                     path_waypoints = []
                     path_index = 0
+                    graph_cache.clear()
+                elif min_front <= effective_replan_threshold:
+                    # object detected ahead: try automatic replan to same goal
+                    # During grace period, skip replanning to trust the fresh plan
+                    if not in_grace_period:
+                        replanned = attempt_replan(consider_static=True)
+                        if not replanned:
+                            # if replan failed, try a local sidestep around the obstacle first
+                            if try_local_avoidance(heading):
+                                graph_cache.clear()
+                            else:
+                                path_waypoints = []
+                                path_index = 0
+                                graph_cache.clear()
+                    # else: in grace period, ignore LIDAR warning and continue following path
                 else:
                     tentative_x = player_x + step_x
                     tentative_y = player_y + step_y
                     tentative_x = max(0, min(world_w - player_w, tentative_x))
                     tentative_y = max(0, min(world_h - player_h, tentative_y))
-                    overlap = wall_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
-                    if overlap is None:
-                        player_x = tentative_x
-                        player_y = tentative_y
-                        heading = desired_heading
+
+                    # predictive swept collision (patch 8)
+                    predicted = swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(tentative_y)),
+                                                      player_mask, combined_mask, samples=swept_samples)
+                    if predicted:
+                        # predicted collision with wall or static object: try replanning to the goal
+                        replanned = attempt_replan(consider_static=True)
+                        if not replanned:
+                            if try_local_avoidance(desired_heading):
+                                graph_cache.clear()
+                            else:
+                                path_waypoints = []
+                                path_index = 0
+                                graph_cache.clear()
                     else:
-                        overlap_x = wall_mask.overlap(player_mask, (int(tentative_x), int(player_y)))
-                        overlap_y = wall_mask.overlap(player_mask, (int(player_x), int(tentative_y)))
-                        if overlap_x is None:
-                            player_x = tentative_x
-                        if overlap_y is None:
-                            player_y = tentative_y
-                        if overlap_x is not None and overlap_y is not None:
-                            path_waypoints = []
-                            path_index = 0
+                        overlap = combined_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
+                        if overlap is None:
+                            # extra perimeter check (patch 3)
+                            if not perimeter_collision_check(int(tentative_x + player_w/2.0), int(tentative_y + player_h/2.0),
+                                                             player_mask, combined_mask,
+                                                             num_samples=8, radius=perimeter_sample_radius):
+                                player_x = tentative_x
+                                player_y = tentative_y
+                                heading = desired_heading
+                            else:
+                                # perimeter grazing collision -> try replanning
+                                replanned = attempt_replan(consider_static=True)
+                                if not replanned:
+                                    if try_local_avoidance(desired_heading):
+                                        graph_cache.clear()
+                                    else:
+                                        path_waypoints = []
+                                        path_index = 0
+                                        graph_cache.clear()
+                        else:
+                            # collision -> try axis moves
+                            overlap_x = combined_mask.overlap(player_mask, (int(tentative_x), int(player_y)))
+                            overlap_y = combined_mask.overlap(player_mask, (int(player_x), int(tentative_y)))
+                            moved = False
+                            if overlap_x is None and not swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(player_y)),
+                                                                               player_mask, combined_mask, samples=swept_samples):
+                                player_x = tentative_x
+                                moved = True
+                            if overlap_y is None and not swept_collision_check((int(player_x), int(player_y)), (int(player_x), int(tentative_y)),
+                                                                               player_mask, combined_mask, samples=swept_samples):
+                                player_y = tentative_y
+                                moved = True
+                            if moved:
+                                heading = desired_heading
+                            else:
+                                # blocked -> try replanning to the same goal
+                                replanned = attempt_replan(consider_static=True)
+                                if not replanned:
+                                    if try_local_avoidance(desired_heading):
+                                        graph_cache.clear()
+                                    else:
+                                        path_waypoints = []
+                                        path_index = 0
+                                        graph_cache.clear()
 
         # camera crop
         crop_w = max(1, win_w // zoom)
@@ -603,6 +846,7 @@ def run(image_path: Path,
         try:
             bg_crop = bg_surf.subsurface(cam_rect)
             wall_crop = wall_surf.subsurface(cam_rect) if show_walls else None
+            static_crop = static_surf.subsurface(cam_rect)
         except ValueError:
             bg_crop = pygame.Surface((crop_w, crop_h))
             bg_crop.blit(bg_surf, (0, 0), cam_rect)
@@ -611,14 +855,15 @@ def run(image_path: Path,
                 wall_crop.blit(wall_surf, (0, 0), cam_rect)
             else:
                 wall_crop = None
+            static_crop = pygame.Surface((crop_w, crop_h), flags=pygame.SRCALPHA)
+            static_crop.blit(static_surf, (0, 0), cam_rect)
 
         bg_scaled = pygame.transform.scale(bg_crop, (win_w, win_h))
         wall_scaled = pygame.transform.scale(wall_crop, (win_w, win_h)) if (wall_crop is not None) else None
+        static_scaled = pygame.transform.scale(static_crop, (win_w, win_h))
 
         # build minimap display from full-res data (preserve walls via maxpool)
-        # reuse the precomputed walls_bin and full-res bg (bg_surf) -- convert bg_surf to numpy
-        bg_arr = pygame.surfarray.array3d(bg_surf)  # (W,H,3) with RGB order but transposed axes; handle carefully
-        # pygame.surfarray.array3d returns (width, height, 3) axis order; transpose to (H,W,3)
+        bg_arr = pygame.surfarray.array3d(bg_surf)
         bg_arr = np.transpose(bg_arr, (1, 0, 2)).copy()
         minimap_surf, minimap_pooled = make_minimap_display(bg_arr, walls_bin, minimap_w, minimap_h)
 
@@ -627,6 +872,8 @@ def run(image_path: Path,
         screen.blit(bg_scaled, (0, 0))
         if wall_scaled is not None:
             screen.blit(wall_scaled, (0, 0))
+        # draw static objects (unknown to planner visually)
+        screen.blit(static_scaled, (0, 0))
 
         # draw planned path in main view
         if path_waypoints and len(path_waypoints) >= 2:
@@ -646,10 +893,11 @@ def run(image_path: Path,
         player_vis = pygame.transform.scale(player_surf, (screen_player_w, screen_player_h))
         screen.blit(player_vis, (screen_player_x, screen_player_y))
 
-        # draw lidar beams
+        # draw lidar beams (now use combined static_mask)
         world_center_x = player_x + player_w / 2.0
         world_center_y = player_y + player_h / 2.0
-        lidar_ranges = get_lidar_distances(world_center_x, world_center_y, heading, wall_mask, (world_w, world_h),
+        lidar_ranges = get_lidar_distances(world_center_x, world_center_y, heading,
+                                           wall_mask, static_mask, (world_w, world_h),
                                            num_beams=num_lidar, max_range=lidar_max)
         half_span = math.pi / 2.0
         rel_angles = [(-half_span) + i * (2 * half_span) / (num_lidar - 1) for i in range(num_lidar)]
@@ -668,7 +916,7 @@ def run(image_path: Path,
 
         # minimap render
         screen.blit(minimap_surf, (minimap_rect.x, minimap_rect.y))
-        # draw path on minimap (map world -> minimap using proportional scaling)
+        # draw path on minimap
         if path_waypoints:
             mini_pts = []
             for (x, y) in path_waypoints:
@@ -682,10 +930,11 @@ def run(image_path: Path,
         mini_ry = minimap_rect.y + int(player_y / world_h * minimap_h)
         pygame.draw.circle(screen, (255, 0, 0), (mini_rx, mini_ry), max(2, int(player_w * minimap_w / world_w)))
 
-        # HUD
+        # HUD with basic static object count and lidar midpoint
         mid_idx = len(lidar_ranges) // 2
         mid_range = lidar_ranges[mid_idx] if lidar_ranges else 0
-        hud = font.render(f'Zoom: {zoom}x  Pos: ({int(player_x)},{int(player_y)})  LIDAR(mid)={mid_range}', True, (255, 255, 255))
+        hud = font.render(f'Zoom: {zoom}x  Pos: ({int(player_x)},{int(player_y)})  LIDAR(mid)={mid_range}  '
+                          f'StaticObjs={len(static_objects)}', True, (255, 255, 255))
         screen.blit(hud, (8, 8))
 
         pygame.display.flip()
@@ -695,7 +944,7 @@ def run(image_path: Path,
 
 # ------------------------ CLI ------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description='Canny Walls - Wall-safe Minimap + Convex Planning')
+    p = argparse.ArgumentParser(description='Canny Walls - Wall-safe Minimap + Convex Planning (patched)')
     p.add_argument('--image', type=Path, default=Path('IMG_6705.jpg'), help='Image (default IMG_6705.jpg)')
     p.add_argument('--width', type=int, default=1920, help='World/image width in pixels')
     p.add_argument('--height', type=int, default=1080, help='World/image height in pixels')
