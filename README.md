@@ -5,9 +5,9 @@ uv venv
 ### Linux 
 source .venv/bin/activate 
 ### Windows
-./venv/Scripts/activate
-uv install requirements.txt
-python demo.py
+#### ./venv/Scripts/activate
+#### uv install requirements.txt
+#### python demo.py
 
 ## Usage
 Click on the goal pose in the minimap.
