@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 import pygame
 
-# import modularized helpers
 from canny_utils import load_and_prepare_mask, make_minimap_display
 from planning import (build_grid_graph_from_mask, find_nearest_node,
                       shortcut_and_simplify, convexify_points, line_free_between_points,
@@ -20,7 +19,7 @@ from planning import (build_grid_graph_from_mask, find_nearest_node,
 from sensors import get_lidar_distances, swept_collision_check, perimeter_collision_check
 from static_objects import place_random_static_objects
 
-# ------------------------ main simulation ------------------------
+DEBUG_PLANNING = True  # Enable verbose planning diagnostics to understand why plans fail
 
 def run(image_path: Path,
         world_w: int = 1920, world_h: int = 1080,
@@ -29,7 +28,7 @@ def run(image_path: Path,
         low: int = 50, high: int = 150):
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption('Canny Walls Robot Simulation')
+    pygame.display.set_caption('Canny Walls - Wall-safe Minimap + Convex Planning (patched)')
     clock = pygame.time.Clock()
 
     # full-res wall mask and display image + binary
@@ -42,13 +41,10 @@ def run(image_path: Path,
     except Exception:
         dist_map = None
 
-    # ------------------ create unknown static objects
-    # compute allowed mask from background: choose dark-gray room pixels (low-to-mid brightness,
-    # low saturation) so static objects appear in rooms rather than bright hallways
+
     try:
         bg_arr_for_mask = pygame.surfarray.array3d(bg_surf)
         bg_arr_for_mask = np.transpose(bg_arr_for_mask, (1, 0, 2)).copy()
-        # convert to HSV to better segment gray (low saturation) and moderate/low brightness
         #RGB limits
         RED_LOW = 70
         RED_HIGH = 100
@@ -69,8 +65,12 @@ def run(image_path: Path,
                                                               grid_cell=1, max_cells=16)
     static_mask = pygame.mask.from_surface(static_surf)
 
-    # combined mask used for movement & LIDAR checks
-    # create combined surface by blitting wall_surf (alpha) then static_surf (opaque)
+    # Print coordinates of static objects
+    print("Placed static objects:")
+    for obj in static_objects:
+        print(" ", obj)
+
+
     combined_surf = pygame.Surface((world_w, world_h), flags=pygame.SRCALPHA)
     combined_surf.fill((0, 0, 0, 0))
     # wall_surf uses wall pixels in alpha; draw as white
@@ -108,7 +108,7 @@ def run(image_path: Path,
     # small robot sprite
     player_w = 2
     player_h = 2
-    player_x = 1542
+    player_x = 1565
     player_y = 900
     speed = 3
 
@@ -246,7 +246,8 @@ def run(image_path: Path,
             return True
 
         def log(msg: str) -> None:
-            pass
+            if DEBUG_PLANNING:
+                print(f"[plan-debug] {msg}")
 
         def attempt_replan(force: bool = False, consider_static: bool = False, _retreat: bool = False) -> bool:
             """Try to plan from current player position to `current_goal`.
@@ -655,13 +656,10 @@ def run(image_path: Path,
         tentative_x = max(0, min(world_w - player_w, tentative_x))
         tentative_y = max(0, min(world_h - player_h, tentative_y))
 
-        # use combined_mask for manual collision checks
         overlap = combined_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
         if overlap is None:
-            # also check swept collision from current to tentative
             if swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(tentative_y)),
                                      player_mask, combined_mask, samples=swept_samples):
-                # predicted collision: do not move
                 pass
             else:
                 if move_dx != 0 or move_dy != 0:
@@ -702,7 +700,6 @@ def run(image_path: Path,
                     if not replanned:
                         log("post-retreat replan failed; will attempt local avoidance on next tick")
             else:
-                # slow down as approaching waypoint
                 step_speed = speed
                 if dist < 12:
                     step_speed = max(1.0, speed * (dist / 12.0))
@@ -714,11 +711,9 @@ def run(image_path: Path,
                 world_center_x = player_x + player_w / 2.0
                 world_center_y = player_y + player_h / 2.0
 
-                # LIDAR checks against walls AND static objects
                 lidar = get_lidar_distances(world_center_x, world_center_y, desired_heading,
                                             wall_mask, static_mask, (world_w, world_h),
                                             num_beams=num_lidar, max_range=lidar_max)
-                # if front is very close, either stop or replan
                 mid = len(lidar) // 2
                 front_slice = lidar[max(0, mid-1): min(len(lidar), mid+2)]
                 min_front = min(front_slice) if front_slice else lidar[mid]
@@ -752,7 +747,7 @@ def run(image_path: Path,
                     tentative_x = max(0, min(world_w - player_w, tentative_x))
                     tentative_y = max(0, min(world_h - player_h, tentative_y))
 
-                    # predictive swept collision
+                    # predictive swept collision (patch 8)
                     predicted = swept_collision_check((int(player_x), int(player_y)), (int(tentative_x), int(tentative_y)),
                                                       player_mask, combined_mask, samples=swept_samples)
                     if predicted:
@@ -768,7 +763,6 @@ def run(image_path: Path,
                     else:
                         overlap = combined_mask.overlap(player_mask, (int(tentative_x), int(tentative_y)))
                         if overlap is None:
-                            # extra perimeter check
                             if not perimeter_collision_check(int(tentative_x + player_w/2.0), int(tentative_y + player_h/2.0),
                                                              player_mask, combined_mask,
                                                              num_samples=8, radius=perimeter_sample_radius):
@@ -776,7 +770,6 @@ def run(image_path: Path,
                                 player_y = tentative_y
                                 heading = desired_heading
                             else:
-                                # perimeter grazing collision -> try replanning
                                 replanned = attempt_replan(consider_static=True)
                                 if not replanned:
                                     if try_local_avoidance(desired_heading):
@@ -924,7 +917,7 @@ def run(image_path: Path,
 
 # ------------------------ CLI ------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description='Canny Walls Robot Simulation')
+    p = argparse.ArgumentParser(description='Canny Walls - Wall-safe Minimap + Convex Planning (patched)')
     p.add_argument('--image', type=Path, default=Path('IMG_6705.jpg'), help='Image (default IMG_6705.jpg)')
     p.add_argument('--width', type=int, default=1920, help='World/image width in pixels')
     p.add_argument('--height', type=int, default=1080, help='World/image height in pixels')

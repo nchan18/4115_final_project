@@ -4,3 +4,5 @@ pygame~=2.5.1
 pymunk~=6.5.1
 networkx>=3.0
 pulp>=2.7
+osqp>=0.6.0
+scipy>=1.10.0
