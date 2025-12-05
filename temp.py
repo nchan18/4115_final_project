@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-CANNY WALLS ROBOT — FINAL WORKING VERSION (December 2025)
-✓ Real physics collisions
-✓ Click minimap to set goal
-✓ Press C to toggle manual/auto
-✓ Stops at exact clicked point
-✓ A* + Pure Pursuit + Convex MPC
+Canny Walls Robot Simulation
 """
 
 import argparse

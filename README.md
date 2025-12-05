@@ -5,7 +5,7 @@ uv venv
 ### Linux 
 source .venv/bin/activate 
 ### Windows
-.venv/Scripts/activate
+./venv/Scripts/activate
 uv install requirements.txt
 python demo.py
 
