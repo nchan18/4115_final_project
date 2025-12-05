@@ -78,7 +78,7 @@ def run(image_path: Path,
 
     # try to place many small rects (no circles) limited to 2x2 cells
     static_surf, static_objects = place_random_static_objects((world_w, world_h), wall_mask,
-                                                              num_rect=0, num_circ=800, seed=None,
+                                                              num_rect=0, num_circ=0, seed=None,
                                                               allowed_mask=allowed_mask,
                                                               grid_cell=1, max_cells=16)
     static_mask = pygame.mask.from_surface(static_surf)
